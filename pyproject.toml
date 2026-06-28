@@ -1,0 +1,124 @@
+[project]
+name = "horus-runtime-plugin"
+description = "A custom plugin for the Horus runtime, providing additional functionality and integrations."
+requires-python = ">=3.13"
+license = "MIT"
+classifiers = [
+  "Programming Language :: Python :: 3",
+]
+dependencies = ["horus-runtime>=0.1.1"]
+dynamic = ["version"]
+
+# ================
+# Plugin entry-points
+# ================
+[project.entry-points."horus.task"]
+custom_task = "my_plugin.task.custom_task"
+
+# ================
+
+[dependency-groups]
+dev = [
+  "babel~=2.0",
+  "mypy~=1.19",
+  "pre_commit~=4.0",
+  "pytest~=9.0",
+  "pytest-asyncio~=1.3.0",
+  "pytest-cov~=7.0",
+  "ruff~=0.15",
+  "types-PyYAML~=6.0",
+  "uv-dynamic-versioning>=0.14.0",
+]
+
+[build-system]
+requires = ["hatchling>=1.29,<2.0", "uv-dynamic-versioning>=0.14.0,<1.0"]
+build-backend = "hatchling.build"
+
+[tool.coverage.run]
+source = ["my_plugin"]
+
+[tool.coverage.report]
+omit = ["tests/*"]
+
+# Other tool configurations
+[tool.hatch.version]
+source = "uv-dynamic-versioning"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/my_plugin"]
+# py.typed ships the type marker; compiled translations are git-ignored (*.mo)
+# but must ship in the wheel.
+artifacts = ["src/my_plugin/py.typed", "src/my_plugin/locale/**/*.mo"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/my_plugin", "tests"]
+artifacts = ["src/my_plugin/py.typed", "src/my_plugin/locale/**/*.mo"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+exclude = ["build", "dist"]
+plugins = ["pydantic.mypy"]
+
+[tool.pydantic-mypy]
+init_typed = true
+init_forbid_extra = true
+warn_required_dynamic_aliases = true
+
+[tool.pytest.ini_options]
+addopts = """
+    --verbose
+    --cov=src/my_plugin
+    --cov-report=html
+    --cov-report=term-missing
+    --cov-fail-under=90
+"""
+minversion = "7.0"
+python_classes = ["Test*"]
+python_files = ["test_*.py", "*_test.py"]
+python_functions = ["test_*"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 79
+target-version = "py313"
+exclude = [".git", ".venv", "build", "dist", "__pycache__"]
+
+[tool.ruff.lint]
+select = [
+  "D",  # pydocstyle
+  "E",  # pycodestyle errors
+  "W",  # pycodestyle warnings
+  "F",  # pyflakes
+  "I",  # isort
+  "N",  # pep8-naming
+  "UP",  # pyupgrade
+  "B",  # flake8-bugbear
+  "PL",  # pylint
+  "RUF",  # ruff-specific
+  "ARG",  # ruff-arglint
+  "SLF",  # ruff-slf
+]
+extend-select = ["T201"]  # Prevent use of print()
+
+ignore = [
+  "E203",  # Whitespace before ':', conflicts with formatter
+  "D104",  # Missing docstring in __init__ (often redundant)
+  "D205",  # 1 blank line required between summary line and description
+  "D212",  # Multi-line docstring summary should start at the first line
+  "D200",  # One-line docstring should fit on one line
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["SLF001"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.uv-dynamic-versioning]
+fallback-version = "0.0.1"
