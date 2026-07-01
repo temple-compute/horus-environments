@@ -149,6 +149,23 @@ class TestEnvironmentCommandBuilders:
         assert "conda create -y -p" in command
         assert "python=3.13" in command
         assert " pip" in command
+        # A pinned version must recreate the env when it drifts, not blindly
+        # reuse whatever interpreter already exists.
+        assert "sys.version_info.major" in command
+        assert "!= 3.13" in command
+        assert "rm -rf" in command
+
+    def test_conda_setup_without_version_uses_existence_check(self) -> None:
+        """Without a pinned version, conda reuses any existing interpreter."""
+        executor = CondaPythonEnvironmentExecutor()
+        task = _make_command_task(executor)
+
+        command = executor._create_environment_command(task)
+
+        assert "conda create -y -p" in command
+        assert "python " in command  # unpinned interpreter
+        assert "sys.version_info.major" not in command
+        assert "rm -rf" not in command
 
     def test_requirements_are_installed_with_pip(self) -> None:
         """Requirements are shell-quoted and installed into the environment."""
@@ -235,9 +252,9 @@ class TestEnvironmentCommandBuilders:
         command = executor._run_command(task, "echo hi")
         python = executor._run_python_script_command(task, "/tmp/run.py")
 
-        assert command.startswith("mamba run -p")
+        assert command.startswith("mamba run --no-capture-output -p")
         assert "/bin/sh -c" in command
-        assert python.startswith("mamba run -p")
+        assert python.startswith("mamba run --no-capture-output -p")
         assert " python /tmp/run.py" in python
 
 

@@ -101,6 +101,45 @@ class PythonEnvironmentExecutor(BaseExecutor):
             f" -m pip install {requirements}"
         )
 
+    @staticmethod
+    def _version_probe_snippet() -> str:
+        """Python one-liner that prints the interpreter's ``major.minor``."""
+        return (
+            "import sys; "
+            "print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+        )
+
+    def _reuse_or_create_command(
+        self, task: "BaseTask", create: str, version: str | None
+    ) -> str:
+        """
+        Return a shell snippet that reuses the env when the interpreter exists
+        (and, when ``version`` is given, matches ``major.minor``), otherwise
+        wipes and recreates it with ``create``.
+        """
+        env_path = shlex.quote(self._environment_path(task))
+        python_bin = shlex.quote(self._python_bin(task))
+        if version is not None:
+            probe = shlex.quote(self._version_probe_snippet())
+            stale = (
+                f"[ ! -x {python_bin} ]"
+                f' || [ "$({python_bin} -c {probe} 2>/dev/null)"'
+                f" != {shlex.quote(version)} ]"
+            )
+            return (
+                f"if {stale};"
+                f" then {self._create_log_command(task)}"
+                f" && rm -rf {env_path} && {create};"
+                f" else {self._reuse_log_command(task)};"
+                f" fi"
+            )
+        return (
+            f"if [ -x {python_bin} ];"
+            f" then {self._reuse_log_command(task)};"
+            f" else {self._create_log_command(task)} && {create};"
+            f" fi"
+        )
+
     def _create_environment_command(self, task: "BaseTask") -> str:
         """
         Return the shell command that ensures the environment exists.
@@ -188,10 +227,10 @@ class PythonEnvironmentExecutor(BaseExecutor):
         )
 
         env = {
+            **self.env,
             runtime_settings.SIDE_ARTIFACTS_DIR_ENV: str(
                 task.side_artifacts_dir
             ),
-            **self.env,
         }
         proc = await task.target.run_command(
             full_command,
@@ -256,13 +295,19 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
             if self.python_version
             else "python"
         )
-        return (
-            f"if [ -x {shlex.quote(self._python_bin(task))} ];"
-            f" then {self._reuse_log_command(task)};"
-            f" else {self._create_log_command(task)}"
-            f" && {conda} create -y -p {env_path} {python} pip;"
-            f" fi"
+        create = f"{conda} create -y -p {env_path} {python} pip"
+        return self._reuse_or_create_command(
+            task, create, self._requested_python_version()
         )
+
+    def _requested_python_version(self) -> str | None:
+        """Return the requested ``major.minor`` version, if one was given."""
+        if self.python_version is None:
+            return None
+        match = re.search(
+            r"(?<!\d)(\d+\.\d+)(?:\.\d+)?(?!\d)", self.python_version
+        )
+        return match.group(1) if match else None
 
     def _pip_install_command(self, task: "BaseTask") -> str | None:
         """Install requirements through ``conda run``."""
@@ -280,7 +325,7 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
         conda = shlex.quote(self.conda)
         env_path = shlex.quote(self._environment_path(task))
         return (
-            f"{conda} run -p {env_path}"
+            f"{conda} run --no-capture-output -p {env_path}"
             f" /bin/sh -c {shlex.quote(prepared_command)}"
         )
 
@@ -290,7 +335,10 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
         """Run a Python script with ``conda run``."""
         conda = shlex.quote(self.conda)
         env_path = shlex.quote(self._environment_path(task))
-        return f"{conda} run -p {env_path} python {shlex.quote(script_path)}"
+        return (
+            f"{conda} run --no-capture-output -p {env_path}"
+            f" python {shlex.quote(script_path)}"
+        )
 
 
 class UvPythonEnvironmentExecutor(PythonEnvironmentExecutor):
@@ -328,30 +376,11 @@ class UvPythonEnvironmentExecutor(PythonEnvironmentExecutor):
     def _create_environment_command(self, task: "BaseTask") -> str:
         """Return the uv venv creation command."""
         env_path = shlex.quote(self._environment_path(task))
-        python_bin = shlex.quote(self._python_bin(task))
         uv = shlex.quote(self.uv)
         python = f" --python {shlex.quote(self.python)}" if self.python else ""
         create = f"{uv} venv{python} {env_path}"
-        requested_version = self._requested_python_version()
-        if requested_version is not None:
-            version_probe = (
-                "import sys; "
-                "print(f'{sys.version_info.major}.{sys.version_info.minor}')"
-            )
-            return (
-                f"if [ ! -x {python_bin} ]"
-                f' || [ "$({python_bin} -c {shlex.quote(version_probe)}'
-                f' 2>/dev/null)" != {shlex.quote(requested_version)} ];'
-                f" then {self._create_log_command(task)}"
-                f" && rm -rf {env_path} && {create};"
-                f" else {self._reuse_log_command(task)};"
-                f" fi"
-            )
-        return (
-            f"if [ -x {python_bin} ];"
-            f" then {self._reuse_log_command(task)};"
-            f" else {self._create_log_command(task)} && {create};"
-            f" fi"
+        return self._reuse_or_create_command(
+            task, create, self._requested_python_version()
         )
 
     def _pip_install_command(self, task: "BaseTask") -> str | None:
