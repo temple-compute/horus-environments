@@ -103,6 +103,33 @@ executor = VirtualenvPythonEnvironmentExecutor(
 )
 ```
 
+### As a workflow task (YAML)
+
+Set `executor.kind` on any `horus_task` and the environment options become task
+fields. Here a task runs `boltz` inside a uv-provisioned env pinned to Python
+3.11:
+
+```yaml
+kind: horus_workflow
+name: Boltz2 Virtual Screening
+tasks:
+  - kind: horus_task
+    id: predict
+    name: Boltz-2 structure + affinity
+    executor:
+      kind: uv_python_environment   # or conda_/virtualenv_python_environment
+      python: "3.11"
+      requirements:
+        - boltz
+      env:
+        TZ: UTC
+    runtime:
+      kind: command
+      command: boltz predict inputs --out_dir out --accelerator cpu
+    target:
+      kind: local
+```
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
