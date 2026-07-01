@@ -1,11 +1,11 @@
-# Translations template for my_plugin.
+# Translations template for horus_environments.
 # Copyright (C) 2026 YOUR_ORGANIZATION_NAME
-# This file is distributed under the same license as the my_plugin project.
+# This file is distributed under the same license as the horus_environments project.
 #
 #, fuzzy
 msgid ""
 msgstr ""
-"Project-Id-Version: my_plugin VERSION\n"
+"Project-Id-Version: horus_environments VERSION\n"
 "Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
 "POT-Creation-Date: 2026-04-12 00:00+0000\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
@@ -16,6 +16,6 @@ msgstr ""
 "Content-Transfer-Encoding: 8bit\n"
 "Generated-By: Babel 2.18.0\n"
 
-#: src/my_plugin/task/custom_task.py
+#: src/horus_environments/task/custom_task.py
 msgid "CustomTask._run() is not implemented yet."
 msgstr ""
