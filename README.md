@@ -3,5 +3,106 @@
 [![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A horus-runtime plugin that automatically provisions conda, uv or virtualenv environments for tasks.
+A [horus-runtime](https://pypi.org/project/horus-runtime/) plugin that runs
+Horus tasks inside an isolated Python environment it provisions for you. Point a
+task at one of these executors and it will create the environment on the task
+target (once, then reuse it on later runs), `pip install` your requirements, and
+run your command or Python code inside it.
 
+Three backends, one interface:
+
+| `kind` | Backend | Creates the env with |
+| --- | --- | --- |
+| `conda_python_environment` | Conda | `conda create -p <dir>` |
+| `uv_python_environment` | [uv](https://docs.astral.sh/uv/) | `uv venv <dir>` |
+| `virtualenv_python_environment` | stdlib `venv` | `python -m venv <dir>` |
+
+## Install
+
+```bash
+pip install horus-environments
+```
+
+## Options
+
+All backends share these fields:
+
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `requirements` | `[]` | Packages pip-installed into the env |
+| `env` | `{}` | Extra environment variables for the process |
+| `environment_dir` | `.horus_python_environment` | Env location, relative to the task working dir |
+| `recreate` | `false` | Wipe and rebuild the env before running |
+
+Backend-specific:
+
+- **conda** — `conda` (executable, default `"conda"`), `python_version` (e.g. `"3.12"`)
+- **uv** — `uv` (executable, default `"uv"`), `python` (interpreter or version)
+- **virtualenv** — `python` (interpreter used to build the venv, default `"python"`)
+
+If the env already exists (and, when you pin a version, the interpreter matches),
+it is reused instead of rebuilt.
+
+## Examples
+
+### Run a shell command in a uv environment
+
+```python
+from horus_builtin.runtime.command import CommandRuntime
+from horus_builtin.task.horus_task import HorusTask
+from horus_environments.executor.environment import (
+    UvPythonEnvironmentExecutor,
+)
+
+task = HorusTask(
+    id="fetch-report",
+    name="fetch_report",
+    executor=UvPythonEnvironmentExecutor(
+        python="3.13",
+        requirements=["requests==2.32.*"],
+    ),
+    runtime=CommandRuntime(command="python -m mypackage --report"),
+)
+await task.execute()
+```
+
+### Run Python code in a pinned Conda environment
+
+```python
+from horus_builtin.runtime.python_string import PythonCodeStringRuntime
+from horus_builtin.task.horus_task import HorusTask
+from horus_environments.executor.environment import (
+    CondaPythonEnvironmentExecutor,
+)
+
+task = HorusTask(
+    id="analyze",
+    name="analyze",
+    executor=CondaPythonEnvironmentExecutor(
+        python_version="3.11",
+        requirements=["pandas", "numpy"],
+    ),
+    runtime=PythonCodeStringRuntime(
+        code="import pandas as pd; print(pd.__version__)",
+    ),
+)
+await task.execute()
+```
+
+### Throwaway virtualenv, rebuilt every run
+
+```python
+from horus_environments.executor.environment import (
+    VirtualenvPythonEnvironmentExecutor,
+)
+
+executor = VirtualenvPythonEnvironmentExecutor(
+    python="python3.13",
+    environment_dir=".venv-ci",
+    recreate=True,
+)
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
