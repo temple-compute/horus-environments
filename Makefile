@@ -1,7 +1,7 @@
 # Makefile for Horus Runtime plugin development
 
 # Command definitions (used in CI and locally)
-PYTEST_CMD = pytest --cov=src/my_plugin --cov-report=xml --cov-report=html --cov-report=term --junitxml=test-results.xml
+PYTEST_CMD = pytest --cov=src/horus_environments --cov-report=xml --cov-report=html --cov-report=term --junitxml=test-results.xml
 RUFF_LINT_CMD = ruff check src/ tests/
 RUFF_FORMAT_CHECK_CMD = ruff format --check --diff .
 RUFF_FIX_CMD = ruff check --fix src/ tests/
@@ -10,14 +10,14 @@ MYPY_CMD = mypy src/ tests/
 
 # i18n settings (babel)
 BABEL_CFG = babel.cfg
-LOCALE_DIR = src/my_plugin/locale
+LOCALE_DIR = src/horus_environments/locale
 MESSAGES_POT = $(LOCALE_DIR)/messages.pot
-DOMAIN = my_plugin
-SOURCE_DIR = src/my_plugin
+DOMAIN = horus_environments
+SOURCE_DIR = src/horus_environments
 
 # Variables used for babel metadata
-PROJECT_NAME = horus-runtime-plugin
-ORGANIZATION = YOUR_ORGANIZATION_NAME
+PROJECT_NAME = horus-environments
+ORGANIZATION = Temple Compute
 
 .PHONY: test lint format type-check clean help ruff-check ruff-format-check mypy-check babel-update babel-check babel-add babel-extract
 

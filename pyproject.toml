@@ -1,19 +1,19 @@
 [project]
-name = "horus-runtime-plugin"
-description = "A custom plugin for the Horus runtime, providing additional functionality and integrations."
+name = "horus-environments"
+description = "Automatically provision python virtual environments for Horus tasks."
 requires-python = ">=3.13"
 license = "MIT"
 classifiers = [
   "Programming Language :: Python :: 3",
 ]
-dependencies = ["horus-runtime>=0.1.1"]
+dependencies = ["horus-runtime>=0.1.4"]
 dynamic = ["version"]
 
 # ================
 # Plugin entry-points
 # ================
-[project.entry-points."horus.task"]
-custom_task = "my_plugin.task.custom_task"
+[project.entry-points."horus.executor"]
+python_environment = "horus_environments.executor.environment"
 
 # ================
 
@@ -35,7 +35,7 @@ requires = ["hatchling>=1.29,<2.0", "uv-dynamic-versioning>=0.14.0,<1.0"]
 build-backend = "hatchling.build"
 
 [tool.coverage.run]
-source = ["my_plugin"]
+source = ["horus_environments"]
 
 [tool.coverage.report]
 omit = ["tests/*"]
@@ -45,14 +45,20 @@ omit = ["tests/*"]
 source = "uv-dynamic-versioning"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/my_plugin"]
+packages = ["src/horus_environments"]
 # py.typed ships the type marker; compiled translations are git-ignored (*.mo)
 # but must ship in the wheel.
-artifacts = ["src/my_plugin/py.typed", "src/my_plugin/locale/**/*.mo"]
+artifacts = [
+  "src/horus_environments/py.typed",
+  "src/horus_environments/locale/**/*.mo"
+]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/my_plugin", "tests"]
-artifacts = ["src/my_plugin/py.typed", "src/my_plugin/locale/**/*.mo"]
+include = ["src/horus_environments", "tests"]
+artifacts = [
+  "src/horus_environments/py.typed",
+  "src/horus_environments/locale/**/*.mo"
+]
 
 [tool.mypy]
 python_version = "3.13"
@@ -68,7 +74,7 @@ warn_required_dynamic_aliases = true
 [tool.pytest.ini_options]
 addopts = """
     --verbose
-    --cov=src/my_plugin
+    --cov=src/horus_environments
     --cov-report=html
     --cov-report=term-missing
     --cov-fail-under=90
