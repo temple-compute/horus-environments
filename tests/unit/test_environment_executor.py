@@ -167,6 +167,59 @@ class TestEnvironmentCommandBuilders:
         assert "sys.version_info.major" not in command
         assert "rm -rf" not in command
 
+    def test_conda_setup_includes_channels_and_conda_reqs(self) -> None:
+        """Channels and conda packages are baked into the create command."""
+        executor = CondaPythonEnvironmentExecutor(
+            python_version="3.11",
+            channels=["conda-forge", "bioconda"],
+            conda_requirements=["vina", "rdkit"],
+        )
+        task = _make_command_task(executor)
+
+        command = executor._create_environment_command(task)
+
+        assert "conda create -y" in command
+        assert "-c conda-forge" in command
+        assert "-c bioconda" in command
+        assert "python=3.11" in command
+        assert " pip " in command
+        assert " vina" in command
+        assert " rdkit" in command
+        # Channels precede the -p target, packages follow it.
+        assert command.index("-c conda-forge") < command.index("-p ")
+        assert command.index("-p ") < command.index("vina")
+
+    def test_conda_setup_shell_quotes_conda_requirements(self) -> None:
+        """Conda package specs are shell-quoted."""
+        executor = CondaPythonEnvironmentExecutor(
+            conda_requirements=["numpy>=2", "some package"]
+        )
+        task = _make_command_task(executor)
+
+        command = executor._create_environment_command(task)
+
+        assert "'numpy>=2'" in command
+        assert "'some package'" in command
+
+    def test_conda_setup_from_environment_file(self) -> None:
+        """An environment_file is created with `conda env create -f`."""
+        executor = CondaPythonEnvironmentExecutor(
+            environment_file="env.yaml",
+            # These are ignored when a file is given.
+            channels=["conda-forge"],
+            conda_requirements=["vina"],
+            python_version="3.11",
+        )
+        task = _make_command_task(executor)
+
+        command = executor._create_environment_command(task)
+
+        assert "conda env create -f env.yaml -p" in command
+        assert "vina" not in command
+        assert "-c conda-forge" not in command
+        # No version probe when the file owns the interpreter.
+        assert "sys.version_info.major" not in command
+
     def test_requirements_are_installed_with_pip(self) -> None:
         """Requirements are shell-quoted and installed into the environment."""
         executor = VirtualenvPythonEnvironmentExecutor(
@@ -245,17 +298,31 @@ class TestEnvironmentCommandBuilders:
         assert "/bin/sh -c" in command
 
     def test_conda_runtime_commands_use_conda_run(self) -> None:
-        """Conda wraps shell commands and Python scripts with conda run."""
-        executor = CondaPythonEnvironmentExecutor(conda="mamba")
+        """Conda wraps commands with `conda run --no-capture-output`."""
+        executor = CondaPythonEnvironmentExecutor(conda="conda")
         task = _make_command_task(executor)
 
         command = executor._run_command(task, "echo hi")
         python = executor._run_python_script_command(task, "/tmp/run.py")
 
-        assert command.startswith("mamba run --no-capture-output -p")
+        assert command.startswith("conda run --no-capture-output -p")
         assert "/bin/sh -c" in command
-        assert python.startswith("mamba run --no-capture-output -p")
+        assert python.startswith("conda run --no-capture-output -p")
         assert " python /tmp/run.py" in python
+
+    def test_mamba_runtime_commands_omit_no_capture_output(self) -> None:
+        """mamba/micromamba reject --no-capture-output; it must be omitted."""
+        for exe in ("mamba", "micromamba", "/opt/homebrew/bin/micromamba"):
+            executor = CondaPythonEnvironmentExecutor(conda=exe)
+            task = _make_command_task(executor)
+
+            command = executor._run_command(task, "echo hi")
+            python = executor._run_python_script_command(task, "/tmp/run.py")
+
+            assert "--no-capture-output" not in command
+            assert "--no-capture-output" not in python
+            assert command.startswith(f"{exe} run -p")
+            assert python.startswith(f"{exe} run -p")
 
 
 @pytest.mark.unit
