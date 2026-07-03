@@ -36,12 +36,20 @@ All backends share these fields:
 
 Backend-specific:
 
-- **conda** — `conda` (executable, default `"conda"`), `python_version` (e.g. `"3.12"`)
+- **conda** — `conda` (executable, default `"conda"`), `python_version` (e.g. `"3.12"`), plus:
+  - `channels` — conda channels searched for packages, e.g. `["conda-forge"]` (passed as `-c` in order)
+  - `conda_requirements` — packages installed **from conda channels** (as opposed to the pip-installed `requirements`)
+  - `environment_file` — path to a conda `environment.yaml`; when set the env is built from it with `conda env create -f` and `channels`/`conda_requirements`/`python_version` are ignored (pip `requirements` still install afterwards)
 - **uv** — `uv` (executable, default `"uv"`), `python` (interpreter or version)
 - **virtualenv** — `python` (interpreter used to build the venv, default `"python"`)
 
 If the env already exists (and, when you pin a version, the interpreter matches),
-it is reused instead of rebuilt.
+it is reused instead of rebuilt. `conda_requirements` are baked into `conda
+create`, so they resolve once at provisioning time — change them with
+`recreate: true` to force a rebuild. Set `conda` to `mamba` or `micromamba` if
+that's your executable — the executor detects them and drops the conda-only
+`--no-capture-output` flag they don't understand. (`conda env create -f` is
+conda/mamba syntax; micromamba uses `micromamba create -f`.)
 
 ## Examples
 
@@ -87,6 +95,26 @@ task = HorusTask(
     ),
 )
 await task.execute()
+```
+
+### Install compiled tools from conda-forge
+
+For packages that ship prebuilt binaries on conda (no wheels, or C/C++
+dependencies), install them from a channel instead of pip:
+
+```python
+executor = CondaPythonEnvironmentExecutor(
+    python_version="3.11",
+    channels=["conda-forge"],
+    conda_requirements=["vina", "openbabel", "rdkit"],
+    requirements=["some-pip-only-extra"],  # optional pip packages too
+)
+```
+
+Or provision a whole environment from a file:
+
+```python
+executor = CondaPythonEnvironmentExecutor(environment_file="environment.yaml")
 ```
 
 ### Throwaway virtualenv, rebuilt every run
