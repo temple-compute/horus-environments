@@ -39,7 +39,7 @@ Backend-specific:
 - **conda** — `conda` (executable, default `"conda"`), `python_version` (e.g. `"3.12"`), plus:
   - `channels` — conda channels searched for packages, e.g. `["conda-forge"]` (passed as `-c` in order)
   - `conda_requirements` — packages installed **from conda channels** (as opposed to the pip-installed `requirements`)
-  - `environment_file` — path to a conda `environment.yaml`; when set the env is built from it with `conda env create -f` and `channels`/`conda_requirements`/`python_version` are ignored (pip `requirements` still install afterwards)
+  - `environment_file` — path (on the machine running Horus) to a conda `environment.yaml`; it is uploaded to the target and the env is built from it there with `conda env create -f`, so the same config works on local and remote targets. `channels`/`conda_requirements`/`python_version` are ignored when set (pip `requirements` still install afterwards)
 - **uv** — `uv` (executable, default `"uv"`), `python` (interpreter or version)
 - **virtualenv** — `python` (interpreter used to build the venv, default `"python"`)
 
@@ -111,7 +111,8 @@ executor = CondaPythonEnvironmentExecutor(
 )
 ```
 
-Or provision a whole environment from a file:
+Or provision a whole environment from a file. The file is read on the machine
+running Horus and uploaded to the target, so it works with remote targets too:
 
 ```python
 executor = CondaPythonEnvironmentExecutor(environment_file="environment.yaml")

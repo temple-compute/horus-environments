@@ -6,6 +6,7 @@ import asyncio
 import re
 import shlex
 from contextlib import aclosing
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 from horus_builtin.runtime.command import CommandRuntime
@@ -209,11 +210,20 @@ class PythonEnvironmentExecutor(BaseExecutor):
             }
         )
 
+    async def _stage_environment(self, task: "BaseTask") -> None:
+        """
+        Upload any executor-side files the setup commands depend on.
+
+        No-op by default. Overridden by backends (e.g. Conda) that build the
+        environment from a file which must be shipped to the target first.
+        """
+
     async def _execute(self, task: "BaseTask") -> None:
         """
         Provision the selected Python environment and execute the runtime.
         """
         await task.target.mkdir(task.working_dir)
+        await self._stage_environment(task)
         run_command = await self._runtime_command(task)
         full_command = " && ".join([*self._setup_commands(task), run_command])
 
@@ -295,10 +305,12 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
 
     environment_file: str | None = None
     """
-    Path (on the target) to a conda ``environment.yaml``. When set the env is
-    created from it with ``conda env create -f`` and ``channels`` /
-    ``conda_requirements`` / ``python_version`` are ignored — the file is
-    authoritative. Pip ``requirements`` are still installed afterwards.
+    Path, on the machine running Horus, to a conda ``environment.yaml``. When
+    set the file is uploaded to the target and the env is created from it with
+    ``conda env create -f`` there, so the same config works on local and remote
+    targets. ``channels`` / ``thoritative. Pip ``requirements`` are still
+    installed afterwards.conda_requirements`` / ``python_version`` are
+    ignored — the file is au
     """
 
     def _environment_log_name(self) -> str:
@@ -309,6 +321,25 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
         """Return the ``-c <channel>`` flags for the configured channels."""
         return " ".join(f"-c {shlex.quote(c)}" for c in self.channels)
 
+    def _remote_environment_file(self, task: "BaseTask") -> str:
+        """Return the target-side path where ``environment_file`` is staged."""
+        return f"{task.working_dir}/.horus_conda_environment.yaml"
+
+    async def _stage_environment(self, task: "BaseTask") -> None:
+        """Upload ``environment_file`` to the target before provisioning."""
+        if self.environment_file is None:
+            return
+        source = Path(self.environment_file)
+        try:
+            await task.target.put_file(
+                source, self._remote_environment_file(task)
+            )
+        except FileNotFoundError as exc:
+            raise TaskExecutionError(
+                _("Conda environment_file not found: %(path)s")
+                % {"path": self.environment_file}
+            ) from exc
+
     def _create_environment_command(self, task: "BaseTask") -> str:
         """Return the Conda environment creation command."""
         env_path = shlex.quote(self._environment_path(task))
@@ -317,7 +348,8 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
         if self.environment_file is not None:
             create = (
                 f"{conda} env create"
-                f" -f {shlex.quote(self.environment_file)} -p {env_path}"
+                f" -f {shlex.quote(self._remote_environment_file(task))}"
+                f" -p {env_path}"
             )
             # The file owns the interpreter; reuse on existence (no version
             # probe).
