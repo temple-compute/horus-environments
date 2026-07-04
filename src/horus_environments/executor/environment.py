@@ -6,6 +6,7 @@ import asyncio
 import re
 import shlex
 from contextlib import aclosing
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 from horus_builtin.runtime.command import CommandRuntime
@@ -209,11 +210,20 @@ class PythonEnvironmentExecutor(BaseExecutor):
             }
         )
 
+    async def _stage_environment(self, task: "BaseTask") -> None:
+        """
+        Upload any executor-side files the setup commands depend on.
+
+        No-op by default. Overridden by backends (e.g. Conda) that build the
+        environment from a file which must be shipped to the target first.
+        """
+
     async def _execute(self, task: "BaseTask") -> None:
         """
         Provision the selected Python environment and execute the runtime.
         """
         await task.target.mkdir(task.working_dir)
+        await self._stage_environment(task)
         run_command = await self._runtime_command(task)
         full_command = " && ".join([*self._setup_commands(task), run_command])
 
@@ -282,20 +292,82 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
     python_version: str | None = None
     """Optional Python version passed to ``conda create``."""
 
+    channels: list[str] = Field(default_factory=list)
+    """Conda channels, passed as ``-c`` flags in the given order."""
+
+    conda_requirements: list[str] = Field(default_factory=list)
+    """
+    Packages installed from conda channels (as opposed to the pip-installed
+    ``requirements``). They are baked into the ``conda create`` line, so they
+    are resolved once when the environment is provisioned; change them with
+    ``recreate: true`` (or a fresh ``environment_dir``) to force a rebuild.
+    """
+
+    environment_file: str | None = None
+    """
+    Path, on the machine running Horus, to a conda ``environment.yaml``. When
+    set the file is uploaded to the target and the env is created from it with
+    ``conda env create -f`` there, so the same config works on local and remote
+    targets. ``channels`` / ``thoritative. Pip ``requirements`` are still
+    installed afterwards.conda_requirements`` / ``python_version`` are
+    ignored — the file is au
+    """
+
     def _environment_log_name(self) -> str:
         """Return a human-readable backend name for setup logs."""
         return "Conda Python environment"
+
+    def _channel_args(self) -> str:
+        """Return the ``-c <channel>`` flags for the configured channels."""
+        return " ".join(f"-c {shlex.quote(c)}" for c in self.channels)
+
+    def _remote_environment_file(self, task: "BaseTask") -> str:
+        """Return the target-side path where ``environment_file`` is staged."""
+        return f"{task.working_dir}/.horus_conda_environment.yaml"
+
+    async def _stage_environment(self, task: "BaseTask") -> None:
+        """Upload ``environment_file`` to the target before provisioning."""
+        if self.environment_file is None:
+            return
+        source = Path(self.environment_file)
+        try:
+            await task.target.put_file(
+                source, self._remote_environment_file(task)
+            )
+        except FileNotFoundError as exc:
+            raise TaskExecutionError(
+                _("Conda environment_file not found: %(path)s")
+                % {"path": self.environment_file}
+            ) from exc
 
     def _create_environment_command(self, task: "BaseTask") -> str:
         """Return the Conda environment creation command."""
         env_path = shlex.quote(self._environment_path(task))
         conda = shlex.quote(self.conda)
-        python = (
+
+        if self.environment_file is not None:
+            create = (
+                f"{conda} env create"
+                f" -f {shlex.quote(self._remote_environment_file(task))}"
+                f" -p {env_path}"
+            )
+            # The file owns the interpreter; reuse on existence (no version
+            # probe).
+            return self._reuse_or_create_command(task, create, None)
+
+        parts = [f"{conda} create -y"]
+        channels = self._channel_args()
+        if channels:
+            parts.append(channels)
+        parts.append(f"-p {env_path}")
+        parts.append(
             f"python={shlex.quote(self.python_version)}"
             if self.python_version
             else "python"
         )
-        create = f"{conda} create -y -p {env_path} {python} pip"
+        parts.append("pip")
+        parts.extend(shlex.quote(req) for req in self.conda_requirements)
+        create = " ".join(parts)
         return self._reuse_or_create_command(
             task, create, self._requested_python_version()
         )
@@ -320,12 +392,24 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
             f"{conda} run -p {env_path} python -m pip install {requirements}"
         )
 
+    def _run_flags(self) -> str:
+        """Return extra flags for ``<conda> run``.
+
+        ``conda run`` buffers stdout/stderr and only flushes at the end, which
+        would hide Horus's live logs, so we pass ``--no-capture-output``. The
+        drop-in replacements ``mamba``/``micromamba`` exec the command directly
+        (already unbuffered) and *reject* that flag, so it is only emitted for
+        real ``conda``.
+        """
+        executable = self.conda.rsplit("/", 1)[-1]
+        return "" if "mamba" in executable else "--no-capture-output "
+
     def _run_command(self, task: "BaseTask", prepared_command: str) -> str:
         """Run a shell command with ``conda run``."""
         conda = shlex.quote(self.conda)
         env_path = shlex.quote(self._environment_path(task))
         return (
-            f"{conda} run --no-capture-output -p {env_path}"
+            f"{conda} run {self._run_flags()}-p {env_path}"
             f" /bin/sh -c {shlex.quote(prepared_command)}"
         )
 
@@ -336,7 +420,7 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
         conda = shlex.quote(self.conda)
         env_path = shlex.quote(self._environment_path(task))
         return (
-            f"{conda} run --no-capture-output -p {env_path}"
+            f"{conda} run {self._run_flags()}-p {env_path}"
             f" python {shlex.quote(script_path)}"
         )
 
