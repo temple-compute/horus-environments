@@ -1,6 +1,7 @@
 """Unit tests for Python environment executors."""
 
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -167,6 +168,62 @@ class TestEnvironmentCommandBuilders:
         assert "sys.version_info.major" not in command
         assert "rm -rf" not in command
 
+    def test_conda_setup_includes_channels_and_conda_reqs(self) -> None:
+        """Channels and conda packages are baked into the create command."""
+        executor = CondaPythonEnvironmentExecutor(
+            python_version="3.11",
+            channels=["conda-forge", "bioconda"],
+            conda_requirements=["vina", "rdkit"],
+        )
+        task = _make_command_task(executor)
+
+        command = executor._create_environment_command(task)
+
+        assert "conda create -y" in command
+        assert "-c conda-forge" in command
+        assert "-c bioconda" in command
+        assert "python=3.11" in command
+        assert " pip " in command
+        assert " vina" in command
+        assert " rdkit" in command
+        # Channels precede the -p target, packages follow it.
+        assert command.index("-c conda-forge") < command.index("-p ")
+        assert command.index("-p ") < command.index("vina")
+
+    def test_conda_setup_shell_quotes_conda_requirements(self) -> None:
+        """Conda package specs are shell-quoted."""
+        executor = CondaPythonEnvironmentExecutor(
+            conda_requirements=["numpy>=2", "some package"]
+        )
+        task = _make_command_task(executor)
+
+        command = executor._create_environment_command(task)
+
+        assert "'numpy>=2'" in command
+        assert "'some package'" in command
+
+    def test_conda_setup_from_environment_file(self) -> None:
+        """An environment_file is created with `conda env create -f`."""
+        executor = CondaPythonEnvironmentExecutor(
+            environment_file="env.yaml",
+            # These are ignored when a file is given.
+            channels=["conda-forge"],
+            conda_requirements=["vina"],
+            python_version="3.11",
+        )
+        task = _make_command_task(executor)
+
+        command = executor._create_environment_command(task)
+
+        # The command points at the staged (uploaded) copy, not the local path.
+        assert "conda env create -f" in command
+        assert "/.horus_conda_environment.yaml -p" in command
+        assert "-f env.yaml" not in command
+        assert "vina" not in command
+        assert "-c conda-forge" not in command
+        # No version probe when the file owns the interpreter.
+        assert "sys.version_info.major" not in command
+
     def test_requirements_are_installed_with_pip(self) -> None:
         """Requirements are shell-quoted and installed into the environment."""
         executor = VirtualenvPythonEnvironmentExecutor(
@@ -245,17 +302,31 @@ class TestEnvironmentCommandBuilders:
         assert "/bin/sh -c" in command
 
     def test_conda_runtime_commands_use_conda_run(self) -> None:
-        """Conda wraps shell commands and Python scripts with conda run."""
-        executor = CondaPythonEnvironmentExecutor(conda="mamba")
+        """Conda wraps commands with `conda run --no-capture-output`."""
+        executor = CondaPythonEnvironmentExecutor(conda="conda")
         task = _make_command_task(executor)
 
         command = executor._run_command(task, "echo hi")
         python = executor._run_python_script_command(task, "/tmp/run.py")
 
-        assert command.startswith("mamba run --no-capture-output -p")
+        assert command.startswith("conda run --no-capture-output -p")
         assert "/bin/sh -c" in command
-        assert python.startswith("mamba run --no-capture-output -p")
+        assert python.startswith("conda run --no-capture-output -p")
         assert " python /tmp/run.py" in python
+
+    def test_mamba_runtime_commands_omit_no_capture_output(self) -> None:
+        """mamba/micromamba reject --no-capture-output; it must be omitted."""
+        for exe in ("mamba", "micromamba", "/opt/homebrew/bin/micromamba"):
+            executor = CondaPythonEnvironmentExecutor(conda=exe)
+            task = _make_command_task(executor)
+
+            command = executor._run_command(task, "echo hi")
+            python = executor._run_python_script_command(task, "/tmp/run.py")
+
+            assert "--no-capture-output" not in command
+            assert "--no-capture-output" not in python
+            assert command.startswith(f"{exe} run -p")
+            assert python.startswith(f"{exe} run -p")
 
 
 @pytest.mark.unit
@@ -313,6 +384,46 @@ class TestEnvironmentExecutorExecute:
         assert "uv venv" in command
         assert ".horus_python_environment/bin/python" in command
         assert ".horus_python_runtime.py" in command
+
+    @pytest.mark.asyncio
+    async def test_execute_conda_uploads_environment_file(
+        self, horus_context: HorusContext, tmp_path: Path
+    ) -> None:
+        """A conda environment_file is shipped to the target before use."""
+        del horus_context
+        env_yaml = tmp_path / "environment.yaml"
+        env_yaml.write_text("name: demo\n")
+        executor = CondaPythonEnvironmentExecutor(
+            environment_file=str(env_yaml)
+        )
+        task = _make_command_task(executor)
+        target = _make_mock_target()
+
+        with patch.object(task, "target", target):
+            await executor._execute(task)
+
+        remote_path = "/tmp/horus/task-1/.horus_conda_environment.yaml"
+        target.put_file.assert_awaited_once_with(env_yaml, remote_path)
+        command = target.run_command.call_args[0][0]
+        assert f"conda env create -f {remote_path}" in command
+
+    @pytest.mark.asyncio
+    async def test_execute_conda_missing_environment_file_raises(
+        self, horus_context: HorusContext, tmp_path: Path
+    ) -> None:
+        """A missing environment_file surfaces a task error."""
+        del horus_context
+        missing = tmp_path / "does-not-exist.yaml"
+        executor = CondaPythonEnvironmentExecutor(
+            environment_file=str(missing)
+        )
+        task = _make_command_task(executor)
+        target = _make_mock_target()
+        target.put_file = AsyncMock(side_effect=FileNotFoundError)
+
+        with patch.object(task, "target", target):
+            with pytest.raises(TaskExecutionError, match="environment_file"):
+                await executor._execute(task)
 
     @pytest.mark.asyncio
     async def test_execute_nonzero_exit_raises(
