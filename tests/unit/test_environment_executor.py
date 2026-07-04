@@ -1,6 +1,7 @@
 """Unit tests for Python environment executors."""
 
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -214,7 +215,10 @@ class TestEnvironmentCommandBuilders:
 
         command = executor._create_environment_command(task)
 
-        assert "conda env create -f env.yaml -p" in command
+        # The command points at the staged (uploaded) copy, not the local path.
+        assert "conda env create -f" in command
+        assert "/.horus_conda_environment.yaml -p" in command
+        assert "-f env.yaml" not in command
         assert "vina" not in command
         assert "-c conda-forge" not in command
         # No version probe when the file owns the interpreter.
@@ -380,6 +384,46 @@ class TestEnvironmentExecutorExecute:
         assert "uv venv" in command
         assert ".horus_python_environment/bin/python" in command
         assert ".horus_python_runtime.py" in command
+
+    @pytest.mark.asyncio
+    async def test_execute_conda_uploads_environment_file(
+        self, horus_context: HorusContext, tmp_path: Path
+    ) -> None:
+        """A conda environment_file is shipped to the target before use."""
+        del horus_context
+        env_yaml = tmp_path / "environment.yaml"
+        env_yaml.write_text("name: demo\n")
+        executor = CondaPythonEnvironmentExecutor(
+            environment_file=str(env_yaml)
+        )
+        task = _make_command_task(executor)
+        target = _make_mock_target()
+
+        with patch.object(task, "target", target):
+            await executor._execute(task)
+
+        remote_path = "/tmp/horus/task-1/.horus_conda_environment.yaml"
+        target.put_file.assert_awaited_once_with(env_yaml, remote_path)
+        command = target.run_command.call_args[0][0]
+        assert f"conda env create -f {remote_path}" in command
+
+    @pytest.mark.asyncio
+    async def test_execute_conda_missing_environment_file_raises(
+        self, horus_context: HorusContext, tmp_path: Path
+    ) -> None:
+        """A missing environment_file surfaces a task error."""
+        del horus_context
+        missing = tmp_path / "does-not-exist.yaml"
+        executor = CondaPythonEnvironmentExecutor(
+            environment_file=str(missing)
+        )
+        task = _make_command_task(executor)
+        target = _make_mock_target()
+        target.put_file = AsyncMock(side_effect=FileNotFoundError)
+
+        with patch.object(task, "target", target):
+            with pytest.raises(TaskExecutionError, match="environment_file"):
+                await executor._execute(task)
 
     @pytest.mark.asyncio
     async def test_execute_nonzero_exit_raises(
