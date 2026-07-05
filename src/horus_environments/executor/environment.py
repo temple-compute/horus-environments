@@ -350,6 +350,7 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
                 f"{conda} env create"
                 f" -f {shlex.quote(self._remote_environment_file(task))}"
                 f" -p {env_path}"
+                " -y"  # Auto-confirm the creation of the environment
             )
             # The file owns the interpreter; reuse on existence (no version
             # probe).
