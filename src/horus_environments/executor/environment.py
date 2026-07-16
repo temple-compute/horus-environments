@@ -6,6 +6,7 @@ import asyncio
 import re
 import shlex
 from contextlib import aclosing
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 from horus_builtin.runtime.command import CommandRuntime
@@ -320,12 +321,23 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
             f"{conda} run -p {env_path} python -m pip install {requirements}"
         )
 
-    def _run_command(self, task: "BaseTask", prepared_command: str) -> str:
-        """Run a shell command with ``conda run``."""
+    def _run_prefix(self, task: "BaseTask") -> str:
+        """Return the ``<conda> run`` prefix for this executor's binary."""
         conda = shlex.quote(self.conda)
         env_path = shlex.quote(self._environment_path(task))
+        # micromamba streams live and has no --no-capture-output; passing it
+        # derails its prefix_command parser into `exec -- ...`.
+        flag = (
+            ""
+            if Path(self.conda).name.startswith("micromamba")
+            else " --no-capture-output"
+        )
+        return f"{conda} run{flag} -p {env_path}"
+
+    def _run_command(self, task: "BaseTask", prepared_command: str) -> str:
+        """Run a shell command with ``conda run``."""
         return (
-            f"{conda} run --no-capture-output -p {env_path}"
+            f"{self._run_prefix(task)}"
             f" /bin/sh -c {shlex.quote(prepared_command)}"
         )
 
@@ -333,12 +345,7 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
         self, task: "BaseTask", script_path: str
     ) -> str:
         """Run a Python script with ``conda run``."""
-        conda = shlex.quote(self.conda)
-        env_path = shlex.quote(self._environment_path(task))
-        return (
-            f"{conda} run --no-capture-output -p {env_path}"
-            f" python {shlex.quote(script_path)}"
-        )
+        return f"{self._run_prefix(task)} python {shlex.quote(script_path)}"
 
 
 class UvPythonEnvironmentExecutor(PythonEnvironmentExecutor):

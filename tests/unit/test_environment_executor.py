@@ -257,6 +257,21 @@ class TestEnvironmentCommandBuilders:
         assert python.startswith("mamba run --no-capture-output -p")
         assert " python /tmp/run.py" in python
 
+    def test_micromamba_runtime_commands_omit_no_capture_output(self) -> None:
+        """Micromamba has no --no-capture-output; passing it breaks exec."""
+        executor = CondaPythonEnvironmentExecutor(
+            conda="/usr/local/bin/micromamba"
+        )
+        task = _make_command_task(executor)
+
+        command = executor._run_command(task, "echo hi")
+        python = executor._run_python_script_command(task, "/tmp/run.py")
+
+        assert command.startswith("/usr/local/bin/micromamba run -p")
+        assert python.startswith("/usr/local/bin/micromamba run -p")
+        assert "--no-capture-output" not in command
+        assert "--no-capture-output" not in python
+
 
 @pytest.mark.unit
 class TestEnvironmentExecutorExecute:
