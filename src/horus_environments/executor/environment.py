@@ -312,13 +312,22 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
     ``python_version`` are ignored — the file is authoritative. Pip
     ``requirements`` are still installed afterwards.
 
-    The file is uploaded from the machine running Horus.
+    A relative path is resolved against the workflow's directory (see
+    :meth:`anchor_local_paths`) and uploaded from the machine running Horus.
 
     Alternatively ``${artifact_id}`` names an input artifact of the task. The
     file is then whatever the transfer layer already placed on the target, so
     the machine running Horus never needs a copy — this is how an imported
     workflow provisions its environment.
     """
+
+    def anchor_local_paths(self, base: Path) -> None:
+        """Resolve a relative ``environment_file`` against the workflow dir."""
+        if self.environment_file is None or is_template(self.environment_file):
+            return
+        source = Path(self.environment_file)
+        if not source.is_absolute():
+            self.environment_file = str((base / source).resolve())
 
     def _environment_log_name(self) -> str:
         """Return a human-readable backend name for setup logs."""

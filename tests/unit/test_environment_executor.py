@@ -476,6 +476,43 @@ class TestCondaEnvironmentFileResolution:
     artifact already staged on the target.
     """
 
+    def test_relative_path_anchors_to_workflow_dir(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A relative path resolves against the workflow directory, not the
+        process CWD -- otherwise the workflow only runs when Horus happens to
+        be invoked from that directory.
+        """
+        executor = CondaPythonEnvironmentExecutor(
+            environment_file="conda_env.yaml"
+        )
+
+        executor.anchor_local_paths(tmp_path)
+
+        assert executor.environment_file == str(
+            (tmp_path / "conda_env.yaml").resolve()
+        )
+
+    def test_absolute_path_is_left_alone(self, tmp_path: Path) -> None:
+        """An absolute path already names its file; anchoring must not move."""
+        absolute = str(tmp_path / "elsewhere" / "conda_env.yaml")
+        executor = CondaPythonEnvironmentExecutor(environment_file=absolute)
+
+        executor.anchor_local_paths(tmp_path / "workflow")
+
+        assert executor.environment_file == absolute
+
+    def test_template_is_not_anchored(self, tmp_path: Path) -> None:
+        """A template names an artifact, so it is not a path to resolve."""
+        executor = CondaPythonEnvironmentExecutor(
+            environment_file="${conda_env}"
+        )
+
+        executor.anchor_local_paths(tmp_path)
+
+        assert executor.environment_file == "${conda_env}"
+
     async def test_template_resolves_to_artifact_and_skips_upload(
         self, tmp_path: Path
     ) -> None:
