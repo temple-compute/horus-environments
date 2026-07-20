@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from horus_builtin.artifact.file import FileArtifact
 from horus_builtin.runtime.command import CommandRuntime
 from horus_builtin.runtime.python_string import PythonCodeStringRuntime
 from horus_builtin.task.horus_task import HorusTask
@@ -466,3 +467,41 @@ class TestEnvironmentExecutorExecute:
 
         proc.kill.assert_called_once()
         proc.wait.assert_awaited_once()
+
+
+@pytest.mark.unit
+class TestCondaEnvironmentFileResolution:
+    """
+    ``environment_file`` either names a file next to the workflow, or an input
+    artifact already staged on the target.
+    """
+
+    async def test_template_resolves_to_artifact_and_skips_upload(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        With ``environment_file: ${id}`` the file is whatever the transfer
+        layer put on the target, so nothing is uploaded from this machine.
+        """
+        staged = tmp_path / "conda_env.yaml"
+        staged.write_text("dependencies: [python=3.12]\n")
+
+        executor = CondaPythonEnvironmentExecutor(
+            environment_file="${conda_env}"
+        )
+        task = HorusTask(
+            id="task-1",
+            name="task_1",
+            executor=executor,
+            runtime=CommandRuntime(command="python --version"),
+            inputs=[FileArtifact(id="conda_env", path=staged)],
+        )
+        target = AsyncMock()
+        target.path_on_target = MagicMock(return_value=str(staged))
+
+        with patch.object(task, "target", target):
+            await executor._stage_environment(task)
+            remote = executor._remote_environment_file(task)
+
+        target.put_file.assert_not_awaited()
+        assert remote == str(staged)

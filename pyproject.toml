@@ -6,7 +6,9 @@ license = "MIT"
 classifiers = [
   "Programming Language :: Python :: 3",
 ]
-dependencies = ["horus-runtime>=0.1.4"]
+# 0.2.1 adds horus_builtin.runtime.substitution.is_template, which the
+# environment executor needs to accept ``environment_file: ${artifact}``.
+dependencies = ["horus-runtime>=0.2.1"]
 dynamic = ["version"]
 
 # ================
