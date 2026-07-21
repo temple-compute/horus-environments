@@ -47,7 +47,7 @@ def _make_mock_proc(
 def _make_mock_target(proc: AsyncMock | None = None) -> MagicMock:
     """Return a mock target whose channel methods are async."""
     target = MagicMock()
-    target.working_directory = "/tmp/horus"
+    target.resolved_working_directory = "/tmp/horus"
     target.mkdir = AsyncMock()
     target.put_file = AsyncMock()
     target.run_command = AsyncMock(return_value=proc or _make_mock_proc())
