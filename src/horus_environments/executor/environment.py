@@ -343,7 +343,19 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
             self.environment_file
         ):
             # Names an input artifact, already materialised on the target.
-            return substitute(self.environment_file, task)
+            resolved = substitute(self.environment_file, task)
+            if is_template(resolved):
+                # ``substitute`` leaves unknown placeholders verbatim, which
+                # would reach conda as a literal '${id}' filename.
+                raise TaskExecutionError(
+                    _(
+                        "Conda environment_file has unresolved placeholder(s) "
+                        "in %(unresolved)s for task %(task_id)s: the artifact "
+                        "id must be declared in that task's inputs."
+                    )
+                    % {"unresolved": resolved, "task_id": task.id}
+                )
+            return resolved
         return f"{task.working_dir}/.horus_conda_environment.yaml"
 
     async def _stage_environment(self, task: "BaseTask") -> None:
