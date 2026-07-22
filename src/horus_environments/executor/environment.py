@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 from horus_builtin.runtime.command import CommandRuntime
 from horus_builtin.runtime.python_string import PythonCodeStringRuntime
+from horus_builtin.runtime.substitution import is_template, substitute
 from horus_runtime.core.executor.base import BaseExecutor, RuntimeFilterType
 from horus_runtime.core.task.exceptions import TaskExecutionError
 from horus_runtime.logging import horus_logger
@@ -305,13 +306,28 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
 
     environment_file: str | None = None
     """
-    Path, on the machine running Horus, to a conda ``environment.yaml``. When
-    set the file is uploaded to the target and the env is created from it with
-    ``conda env create -f`` there, so the same config works on local and remote
-    targets. ``channels`` / ``thoritative. Pip ``requirements`` are still
-    installed afterwards.conda_requirements`` / ``python_version`` are
-    ignored — the file is au
+    Path to a conda ``environment.yaml``. When set, the env is created from it
+    with ``conda env create -f`` on the target, so the same config works on
+    local and remote targets. ``channels`` / ``conda_requirements`` /
+    ``python_version`` are ignored — the file is authoritative. Pip
+    ``requirements`` are still installed afterwards.
+
+    A relative path is resolved against the workflow's directory (see
+    :meth:`anchor_local_paths`) and uploaded from the machine running Horus.
+
+    Alternatively ``${artifact_id}`` names an input artifact of the task. The
+    file is then whatever the transfer layer already placed on the target, so
+    the machine running Horus never needs a copy — this is how an imported
+    workflow provisions its environment.
     """
+
+    def anchor_local_paths(self, base: Path) -> None:
+        """Resolve a relative ``environment_file`` against the workflow dir."""
+        if self.environment_file is None or is_template(self.environment_file):
+            return
+        source = Path(self.environment_file)
+        if not source.is_absolute():
+            self.environment_file = str((base / source).resolve())
 
     def _environment_log_name(self) -> str:
         """Return a human-readable backend name for setup logs."""
@@ -323,11 +339,18 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
 
     def _remote_environment_file(self, task: "BaseTask") -> str:
         """Return the target-side path where ``environment_file`` is staged."""
+        if self.environment_file is not None and is_template(
+            self.environment_file
+        ):
+            # Names an input artifact, already materialised on the target.
+            return substitute(self.environment_file, task)
         return f"{task.working_dir}/.horus_conda_environment.yaml"
 
     async def _stage_environment(self, task: "BaseTask") -> None:
         """Upload ``environment_file`` to the target before provisioning."""
-        if self.environment_file is None:
+        if self.environment_file is None or is_template(self.environment_file):
+            # Nothing to upload: either unset, or supplied as an artifact that
+            # the transfer layer has already put on the target.
             return
         source = Path(self.environment_file)
         try:
