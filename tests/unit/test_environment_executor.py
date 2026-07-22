@@ -542,3 +542,22 @@ class TestCondaEnvironmentFileResolution:
 
         target.put_file.assert_not_awaited()
         assert remote == str(staged)
+
+    def test_undeclared_artifact_id_raises(self) -> None:
+        """
+        A placeholder that names no input artifact must fail loudly here,
+        instead of reaching conda as a literal '${id}' filename.
+        """
+        executor = CondaPythonEnvironmentExecutor(
+            environment_file="${missing_id}"
+        )
+        task = HorusTask(
+            id="task-1",
+            name="task_1",
+            executor=executor,
+            runtime=CommandRuntime(command="python --version"),
+            inputs=[],
+        )
+
+        with pytest.raises(TaskExecutionError, match="missing_id"):
+            executor._remote_environment_file(task)
