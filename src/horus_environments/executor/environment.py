@@ -48,8 +48,10 @@ class PythonEnvironmentExecutor(BaseExecutor):
 
     environment_dir: str = ".horus_python_environment"
     """
-    Directory, relative to the task working directory, where the environment
-    is created.
+    Directory where the environment is created. A relative path is resolved
+    against the task working directory; an absolute path is used as-is
+    (e.g. to point at, and reuse, an environment that already exists on the
+    target).
     """
 
     recreate: bool = False
@@ -59,6 +61,9 @@ class PythonEnvironmentExecutor(BaseExecutor):
 
     def _environment_path(self, task: "BaseTask") -> str:
         """Return the target-side path where the environment lives."""
+        env_dir = Path(self.environment_dir)
+        if env_dir.is_absolute():
+            return str(env_dir)
         return f"{task.working_dir}/{self.environment_dir}"
 
     def _python_bin(self, task: "BaseTask") -> str:
