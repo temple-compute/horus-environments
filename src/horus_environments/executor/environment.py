@@ -6,7 +6,7 @@ import asyncio
 import re
 import shlex
 from contextlib import aclosing
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, ClassVar
 
 from horus_builtin.runtime.command import CommandRuntime
@@ -65,6 +65,29 @@ class PythonEnvironmentExecutor(BaseExecutor):
         if env_dir.is_absolute():
             return str(env_dir)
         return f"{task.working_dir}/{self.environment_dir}"
+
+    def _locked_setup_command(self, task: "BaseTask") -> str:
+        """
+        Return the setup commands run under a lock on the environment.
+
+        Map clones (and any tasks sharing ``environment_dir`` on one target)
+        start together. Each checks for the interpreter and, finding none,
+        builds the same environment at once: a lost race leaves a broken
+        environment, and conda/mamba serialize on their package cache, so
+        every clone pays for a full build. Under ``flock`` the first builds
+        it and the rest wait, then reuse it. A target without ``flock``
+        runs the setup unlocked, as before.
+        """
+        env_path = self._environment_path(task)
+        setup = " && ".join(self._setup_commands(task))
+        parent = shlex.quote(str(PurePosixPath(env_path).parent))
+        lock = shlex.quote(f"{env_path}.lock")
+        return (
+            f"mkdir -p {parent} && "
+            f"if command -v flock >/dev/null 2>&1;"
+            f" then flock {lock} /bin/sh -c {shlex.quote(setup)};"
+            f" else {setup}; fi"
+        )
 
     def _python_bin(self, task: "BaseTask") -> str:
         """Return the target-side Python executable inside the environment."""
@@ -231,7 +254,7 @@ class PythonEnvironmentExecutor(BaseExecutor):
         await task.target.mkdir(task.working_dir)
         await self._stage_environment(task)
         run_command = await self._runtime_command(task)
-        full_command = " && ".join([*self._setup_commands(task), run_command])
+        full_command = f"{self._locked_setup_command(task)} && {run_command}"
 
         horus_logger.log.debug(
             _("Executing task %(task_id)s in %(executor)s: %(command)s")
