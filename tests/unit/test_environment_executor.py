@@ -1,6 +1,7 @@
 """Unit tests for Python environment executors."""
 
 import asyncio
+import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -359,6 +360,34 @@ class TestEnvironmentExecutorExecute:
         kwargs = target.run_command.call_args.kwargs
         assert kwargs["cwd"] == expected_working_dir
         assert kwargs["env"]["EXTRA"] == "1"
+
+    def test_concurrent_setups_build_the_environment_once(
+        self, tmp_path: Path
+    ) -> None:
+        """Clones starting together build a shared environment once."""
+        env_dir = tmp_path / "envs" / "shared"
+        executor = VirtualenvPythonEnvironmentExecutor(
+            environment_dir=str(env_dir)
+        )
+        task = _make_command_task(executor)
+        log = tmp_path / "log"
+        # Stand-in for the real build: slow, and only when nothing is there.
+        with patch.object(
+            VirtualenvPythonEnvironmentExecutor,
+            "_setup_commands",
+            return_value=[
+                f"if [ ! -e {env_dir}/built ]; then echo build >> {log}"
+                f" && sleep 0.3 && mkdir -p {env_dir}"
+                f" && touch {env_dir}/built;"
+                f" else echo reuse >> {log}; fi"
+            ],
+        ):
+            command = executor._locked_setup_command(task)
+        procs = [
+            subprocess.Popen(["/bin/sh", "-c", command]) for _ in range(4)
+        ]
+        assert [proc.wait() for proc in procs] == [0] * 4
+        assert sorted(log.read_text().split()) == ["build"] + ["reuse"] * 3
 
     @pytest.mark.asyncio
     async def test_execute_python_string_uploads_and_runs_script(
