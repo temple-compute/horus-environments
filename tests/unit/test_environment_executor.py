@@ -2,6 +2,7 @@
 
 import asyncio
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -303,17 +304,18 @@ class TestEnvironmentCommandBuilders:
         assert expected in command
         assert "/bin/sh -c" in command
 
-    def test_conda_runtime_commands_use_conda_run(self) -> None:
-        """Conda wraps commands with `conda run --no-capture-output`."""
+    def test_conda_runtime_commands_use_conda_run_for_hooks(self) -> None:
+        """Envs with activate.d hooks still go through `conda run`."""
         executor = CondaPythonEnvironmentExecutor(conda="conda")
         task = _make_command_task(executor)
 
         command = executor._run_command(task, "echo hi")
         python = executor._run_python_script_command(task, "/tmp/run.py")
 
-        assert command.startswith("conda run --no-capture-output -p")
-        assert "/bin/sh -c" in command
-        assert python.startswith("conda run --no-capture-output -p")
+        assert "/etc/conda/activate.d" in command
+        assert "conda run --no-capture-output -p" in command
+        assert "/bin/sh -c 'echo hi'" in command
+        assert "conda run --no-capture-output -p" in python
         assert " python /tmp/run.py" in python
 
     def test_mamba_runtime_commands_omit_no_capture_output(self) -> None:
@@ -327,8 +329,8 @@ class TestEnvironmentCommandBuilders:
 
             assert "--no-capture-output" not in command
             assert "--no-capture-output" not in python
-            assert command.startswith(f"{exe} run -p")
-            assert python.startswith(f"{exe} run -p")
+            assert f"{exe} run -p" in command
+            assert f"{exe} run -p" in python
 
 
 @pytest.mark.unit
@@ -388,6 +390,56 @@ class TestEnvironmentExecutorExecute:
         ]
         assert [proc.wait() for proc in procs] == [0] * 4
         assert sorted(log.read_text().split()) == ["build"] + ["reuse"] * 3
+
+    @pytest.mark.parametrize("hooks", [False, True])
+    def test_conda_runs_directly_unless_env_has_activation_hooks(
+        self, tmp_path: Path, hooks: bool
+    ) -> None:
+        """Only envs with activate.d hooks pay for `micromamba run`."""
+        env_dir = tmp_path / "env"
+        (env_dir / "bin").mkdir(parents=True)
+        (env_dir / "bin" / "python").symlink_to(sys.executable)
+        if hooks:
+            activate_d = env_dir / "etc" / "conda" / "activate.d"
+            activate_d.mkdir(parents=True)
+            (activate_d / "hook.sh").write_text("")
+        # Fake micromamba: records the call, then activates and runs it.
+        fake_bin = tmp_path / "fake_bin"
+        fake_bin.mkdir()
+        calls = tmp_path / "calls"
+        fake = fake_bin / "micromamba"
+        fake.write_text(
+            f'#!/bin/sh\necho "$@" >> {calls}\n'
+            'export PATH="$3/bin:$PATH" CONDA_PREFIX="$3"\n'
+            'shift 3\nexec "$@"\n'
+        )
+        fake.chmod(0o755)
+        script = tmp_path / "run.py"
+        script.write_text(
+            "import os, sys\nprint(sys.executable, os.environ['CONDA_PREFIX'])"
+        )
+        executor = CondaPythonEnvironmentExecutor(
+            conda="micromamba", environment_dir=str(env_dir)
+        )
+        task = _make_command_task(executor)
+
+        result = subprocess.run(
+            [
+                "/bin/sh",
+                "-c",
+                executor._run_python_script_command(task, str(script)),
+            ],
+            env={"PATH": f"{fake_bin}:/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        assert result.stdout.split() == [
+            str(env_dir / "bin" / "python"),
+            str(env_dir),
+        ]
+        assert calls.exists() is hooks
 
     @pytest.mark.asyncio
     async def test_execute_python_string_uploads_and_runs_script(

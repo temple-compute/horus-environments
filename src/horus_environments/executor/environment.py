@@ -468,25 +468,39 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
         executable = self.conda.rsplit("/", 1)[-1]
         return "" if "mamba" in executable else "--no-capture-output "
 
-    def _run_command(self, task: "BaseTask", prepared_command: str) -> str:
-        """Run a shell command with ``conda run``."""
+    def _in_environment(self, task: "BaseTask", command: str) -> str:
+        """Run a shell-quoted ``command`` inside the Conda environment.
+
+        Concurrent ``micromamba run`` calls on one host share a lock on
+        ``~/.cache/mamba/proc`` and some of them fail, which drops map items.
+        Without ``etc/conda/activate.d`` hooks, activation only puts the env
+        on ``PATH`` and sets ``CONDA_PREFIX``, so the command runs directly.
+        """
+        env_dir = self._environment_path(task)
+        env_path = shlex.quote(env_dir)
+        hooks = shlex.quote(f"{env_dir}/etc/conda/activate.d")
+        bin_dir = shlex.quote(f"{env_dir}/bin")
         conda = shlex.quote(self.conda)
-        env_path = shlex.quote(self._environment_path(task))
+        # shortcut: envs with activate.d hooks still go through <conda> run
+        # and keep its proc-lock race; upgrade if such envs hit it
         return (
-            f"{conda} run {self._run_flags()}-p {env_path}"
-            f" /bin/sh -c {shlex.quote(prepared_command)}"
+            f'if [ -n "$(ls -A {hooks} 2>/dev/null)" ];'
+            f" then {conda} run {self._run_flags()}-p {env_path} {command};"
+            f' else PATH={bin_dir}:"$PATH" CONDA_PREFIX={env_path} {command};'
+            " fi"
+        )
+
+    def _run_command(self, task: "BaseTask", prepared_command: str) -> str:
+        """Run a shell command inside the Conda environment."""
+        return self._in_environment(
+            task, f"/bin/sh -c {shlex.quote(prepared_command)}"
         )
 
     def _run_python_script_command(
         self, task: "BaseTask", script_path: str
     ) -> str:
-        """Run a Python script with ``conda run``."""
-        conda = shlex.quote(self.conda)
-        env_path = shlex.quote(self._environment_path(task))
-        return (
-            f"{conda} run {self._run_flags()}-p {env_path}"
-            f" python {shlex.quote(script_path)}"
-        )
+        """Run a Python script with the Conda environment's interpreter."""
+        return self._in_environment(task, f"python {shlex.quote(script_path)}")
 
 
 class UvPythonEnvironmentExecutor(PythonEnvironmentExecutor):
