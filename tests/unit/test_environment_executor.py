@@ -391,18 +391,23 @@ class TestEnvironmentExecutorExecute:
         assert [proc.wait() for proc in procs] == [0] * 4
         assert sorted(log.read_text().split()) == ["build"] + ["reuse"] * 3
 
-    @pytest.mark.parametrize("hooks", [False, True])
+    @pytest.mark.parametrize("hooks", [None, "activate.d", "variables"])
     def test_conda_runs_directly_unless_env_has_activation_hooks(
-        self, tmp_path: Path, hooks: bool
+        self, tmp_path: Path, hooks: str | None
     ) -> None:
-        """Only envs with activate.d hooks pay for `micromamba run`."""
+        """Only envs with activate.d hooks or variables pay for `run`."""
         env_dir = tmp_path / "env"
         (env_dir / "bin").mkdir(parents=True)
         (env_dir / "bin" / "python").symlink_to(sys.executable)
-        if hooks:
+        if hooks == "activate.d":
             activate_d = env_dir / "etc" / "conda" / "activate.d"
             activate_d.mkdir(parents=True)
             (activate_d / "hook.sh").write_text("")
+        if hooks == "variables":
+            (env_dir / "conda-meta").mkdir()
+            (env_dir / "conda-meta" / "state").write_text(
+                '{"env_vars": {"A": "1"}}'
+            )
         # Fake micromamba: records the call, then activates and runs it.
         fake_bin = tmp_path / "fake_bin"
         fake_bin.mkdir()
@@ -439,7 +444,7 @@ class TestEnvironmentExecutorExecute:
             str(env_dir / "bin" / "python"),
             str(env_dir),
         ]
-        assert calls.exists() is hooks
+        assert calls.exists() is (hooks is not None)
 
     @pytest.mark.asyncio
     async def test_execute_python_string_uploads_and_runs_script(

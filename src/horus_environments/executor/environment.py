@@ -475,16 +475,18 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
         ``~/.cache/mamba/proc`` and some of them fail, which drops map items.
         Without ``etc/conda/activate.d`` hooks, activation only puts the env
         on ``PATH`` and sets ``CONDA_PREFIX``, so the command runs directly.
+        An env with variables (``conda-meta/state``) still activates.
         """
         env_dir = self._environment_path(task)
         env_path = shlex.quote(env_dir)
         hooks = shlex.quote(f"{env_dir}/etc/conda/activate.d")
+        state = shlex.quote(f"{env_dir}/conda-meta/state")
         bin_dir = shlex.quote(f"{env_dir}/bin")
         conda = shlex.quote(self.conda)
-        # shortcut: envs with activate.d hooks still go through <conda> run
+        # shortcut: envs with hooks or variables still go through <conda> run
         # and keep its proc-lock race; upgrade if such envs hit it
         return (
-            f'if [ -n "$(ls -A {hooks} 2>/dev/null)" ];'
+            f'if [ -n "$(ls -A {hooks} 2>/dev/null)" ] || [ -s {state} ];'
             f" then {conda} run {self._run_flags()}-p {env_path} {command};"
             f' else PATH={bin_dir}:"$PATH" CONDA_PREFIX={env_path} {command};'
             " fi"
