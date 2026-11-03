@@ -13,7 +13,10 @@ from horus_builtin.runtime.python_string import PythonCodeStringRuntime
 from horus_builtin.task.horus_task import HorusTask
 from horus_runtime.context import HorusContext
 from horus_runtime.core.executor.base import BaseExecutor
-from horus_runtime.core.task.exceptions import TaskExecutionError
+from horus_runtime.core.task.exceptions import (
+    CommandFailedError,
+    TaskExecutionError,
+)
 
 from horus_environments.executor.environment import (
     CondaPythonEnvironmentExecutor,
@@ -513,10 +516,10 @@ class TestEnvironmentExecutorExecute:
                 await executor._execute(task)
 
     @pytest.mark.asyncio
-    async def test_execute_nonzero_exit_raises(
+    async def test_command_exit_raises_command_failed_error(
         self, horus_context: HorusContext
     ) -> None:
-        """A non-zero environment command exit code raises a task error."""
+        """A non-zero exit raises CommandFailedError with the exit code."""
         del horus_context
         executor = VirtualenvPythonEnvironmentExecutor()
         task = _make_command_task(executor)
@@ -525,8 +528,11 @@ class TestEnvironmentExecutorExecute:
         )
 
         with patch.object(task, "target", target):
-            with pytest.raises(TaskExecutionError, match=str(_NONZERO_CODE)):
+            with pytest.raises(
+                CommandFailedError, match=str(_NONZERO_CODE)
+            ) as exc_info:
                 await executor._execute(task)
+        assert exc_info.value.exit_code == _NONZERO_CODE
 
     @pytest.mark.asyncio
     async def test_execute_cancellation_kills_process(

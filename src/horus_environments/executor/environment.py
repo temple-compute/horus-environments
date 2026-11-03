@@ -13,7 +13,10 @@ from horus_builtin.runtime.command import CommandRuntime
 from horus_builtin.runtime.python_string import PythonCodeStringRuntime
 from horus_builtin.runtime.substitution import is_template, substitute
 from horus_runtime.core.executor.base import BaseExecutor, RuntimeFilterType
-from horus_runtime.core.task.exceptions import TaskExecutionError
+from horus_runtime.core.task.exceptions import (
+    CommandFailedError,
+    TaskExecutionError,
+)
 from horus_runtime.logging import horus_logger
 from horus_runtime.settings import runtime_settings
 from pydantic import Field
@@ -291,14 +294,15 @@ class PythonEnvironmentExecutor(BaseExecutor):
 
         # Draining the stream hits EOF but doesn't reap the process; wait() is
         # what yields a reliable returncode (matches ShellExecutor).
-        await proc.wait()
-        if proc.returncode != 0:
-            raise TaskExecutionError(
+        returncode = await proc.wait()
+        if returncode != 0:
+            raise CommandFailedError(
                 _(
                     "Python environment command exited with return code "
                     "%(code)s"
                 )
-                % {"code": proc.returncode}
+                % {"code": returncode},
+                returncode,
             )
 
 
