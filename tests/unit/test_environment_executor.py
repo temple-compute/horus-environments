@@ -573,8 +573,13 @@ class TestEnvironmentExecutorExecute:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("runtime", ["command", "python"])
+    @pytest.mark.parametrize("backend", ["virtualenv", "conda", "partial"])
     async def test_command_exit_after_real_setup_is_droppable(
-        self, horus_context: HorusContext, tmp_path: Path, runtime: str
+        self,
+        horus_context: HorusContext,
+        tmp_path: Path,
+        runtime: str,
+        backend: str,
     ) -> None:
         """Only the task's own command exit raises CommandFailedError."""
         del horus_context
@@ -582,8 +587,12 @@ class TestEnvironmentExecutorExecute:
         (env_dir / "bin").mkdir(parents=True)
         (env_dir / "bin" / "python").symlink_to(sys.executable)
         (env_dir / "bin" / "activate").write_text("")
-        executor = VirtualenvPythonEnvironmentExecutor(
-            environment_dir=str(env_dir)
+        executor: PythonEnvironmentExecutor = (
+            CondaPythonEnvironmentExecutor(environment_dir=str(env_dir))
+            if backend == "conda"
+            else VirtualenvPythonEnvironmentExecutor(
+                environment_dir=str(env_dir)
+            )
         )
         task = HorusTask(
             id="task-1",
@@ -605,10 +614,27 @@ class TestEnvironmentExecutorExecute:
         )
         target.run_command = AsyncMock(side_effect=_run_in_shell)
 
-        with patch.object(task, "target", target):
-            with pytest.raises(CommandFailedError) as exc:
-                await executor._execute(task)
+        with (
+            patch.object(task, "target", target),
+            # A setup step that leaves "progress" with no trailing newline.
+            patch.object(
+                VirtualenvPythonEnvironmentExecutor,
+                "_pip_install_command",
+                return_value="printf progress"
+                if backend == "partial"
+                else None,
+            ),
+            patch(
+                "horus_environments.executor.environment.horus_logger"
+            ) as logger,
+            pytest.raises(CommandFailedError) as exc,
+        ):
+            await executor._execute(task)
         assert exc.value.exit_code == _NONZERO_CODE
+        logged = [c.args[0] for c in logger.log.info.call_args_list]
+        assert "__horus_environment_ready__" not in str(logged)
+        assert "" not in logged
+        assert ("progress" in logged) is (backend == "partial")
 
     @pytest.mark.asyncio
     async def test_execute_cancellation_kills_process(

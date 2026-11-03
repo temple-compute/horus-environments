@@ -27,9 +27,10 @@ if TYPE_CHECKING:
     from horus_runtime.core.task.base import BaseTask
 
 # Printed right before the task's own command, so a non-zero exit without it
-# is a setup failure, not the command's exit code.
+# is a setup failure, not the command's exit code. The leading newline keeps
+# it on its own line when setup leaves a partial line on stdout.
 _READY_MARKER = "__horus_environment_ready__"
-_READY = f"echo {_READY_MARKER}"
+_READY = f"printf '\\n%s\\n' {_READY_MARKER}"
 
 
 class PythonEnvironmentExecutor(BaseExecutor):
@@ -290,7 +291,8 @@ class PythonEnvironmentExecutor(BaseExecutor):
                 async for stream_name, line in stream:
                     if stream_name == "stdout" and not ready:
                         ready = line.rstrip() == _READY_MARKER.encode()
-                        if ready:
+                        # Also drops the blank line the marker's newline adds.
+                        if ready or not line.strip():
                             continue
                     if stream_name == "stdout":
                         horus_logger.log.info(line.decode("utf-8").rstrip())
