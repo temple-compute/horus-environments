@@ -59,6 +59,14 @@ def _make_mock_target(proc: AsyncMock | None = None) -> MagicMock:
     return target
 
 
+def _run_in_shell(command: str, **_kwargs: object) -> AsyncMock:
+    """Run ``command`` locally and return its result as a channel process."""
+    result = subprocess.run(
+        ["/bin/sh", "-c", command], capture_output=True, check=False
+    )
+    return _make_mock_proc(result.returncode, result.stdout, result.stderr)
+
+
 def _make_command_task(
     executor: PythonEnvironmentExecutor, command: str = "python --version"
 ) -> HorusTask:
@@ -444,6 +452,7 @@ class TestEnvironmentExecutorExecute:
         )
 
         assert result.stdout.split() == [
+            "__horus_environment_ready__",
             str(env_dir / "bin" / "python"),
             str(env_dir),
         ]
@@ -524,7 +533,11 @@ class TestEnvironmentExecutorExecute:
         executor = VirtualenvPythonEnvironmentExecutor()
         task = _make_command_task(executor)
         target = _make_mock_target(
-            _make_mock_proc(returncode=_NONZERO_CODE, stderr=b"failed")
+            _make_mock_proc(
+                returncode=_NONZERO_CODE,
+                stdout=b"__horus_environment_ready__\n",
+                stderr=b"failed",
+            )
         )
 
         with patch.object(task, "target", target):
@@ -533,6 +546,69 @@ class TestEnvironmentExecutorExecute:
             ) as exc_info:
                 await executor._execute(task)
         assert exc_info.value.exit_code == _NONZERO_CODE
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("broken", ["build", "activate"])
+    async def test_setup_failure_is_not_droppable(
+        self, horus_context: HorusContext, tmp_path: Path, broken: str
+    ) -> None:
+        """A failed env build or activation is not the command's exit."""
+        del horus_context
+        env_dir = tmp_path / "env"
+        if broken == "activate":
+            # The interpreter exists, so setup reuses it; bin/activate is gone.
+            (env_dir / "bin").mkdir(parents=True)
+            (env_dir / "bin" / "python").symlink_to(sys.executable)
+        executor = VirtualenvPythonEnvironmentExecutor(
+            python="false", environment_dir=str(env_dir)
+        )
+        task = _make_command_task(executor, "exit 1")
+        target = _make_mock_target()
+        target.run_command = AsyncMock(side_effect=_run_in_shell)
+
+        with patch.object(task, "target", target):
+            with pytest.raises(TaskExecutionError, match="setup") as exc:
+                await executor._execute(task)
+        assert not isinstance(exc.value, CommandFailedError)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("runtime", ["command", "python"])
+    async def test_command_exit_after_real_setup_is_droppable(
+        self, horus_context: HorusContext, tmp_path: Path, runtime: str
+    ) -> None:
+        """Only the task's own command exit raises CommandFailedError."""
+        del horus_context
+        env_dir = tmp_path / "env"
+        (env_dir / "bin").mkdir(parents=True)
+        (env_dir / "bin" / "python").symlink_to(sys.executable)
+        (env_dir / "bin" / "activate").write_text("")
+        executor = VirtualenvPythonEnvironmentExecutor(
+            environment_dir=str(env_dir)
+        )
+        task = HorusTask(
+            id="task-1",
+            name="task_1",
+            executor=executor,
+            runtime=CommandRuntime(command=f"exit {_NONZERO_CODE}")
+            if runtime == "command"
+            else PythonCodeStringRuntime(
+                code=f"raise SystemExit({_NONZERO_CODE})"
+            ),
+        )
+        target = _make_mock_target()
+        target.resolved_working_directory = str(tmp_path)
+        target.mkdir = AsyncMock(
+            side_effect=lambda path: Path(path).mkdir(parents=True)
+        )
+        target.put_file = AsyncMock(
+            side_effect=lambda code, path: Path(path).write_bytes(code)
+        )
+        target.run_command = AsyncMock(side_effect=_run_in_shell)
+
+        with patch.object(task, "target", target):
+            with pytest.raises(CommandFailedError) as exc:
+                await executor._execute(task)
+        assert exc.value.exit_code == _NONZERO_CODE
 
     @pytest.mark.asyncio
     async def test_execute_cancellation_kills_process(

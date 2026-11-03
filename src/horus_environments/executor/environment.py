@@ -26,6 +26,11 @@ from horus_environments.i18n import tr as _
 if TYPE_CHECKING:
     from horus_runtime.core.task.base import BaseTask
 
+# Printed right before the task's own command, so a non-zero exit without it
+# is a setup failure, not the command's exit code.
+_READY_MARKER = "__horus_environment_ready__"
+_READY = f"echo {_READY_MARKER}"
+
 
 class PythonEnvironmentExecutor(BaseExecutor):
     """
@@ -188,9 +193,8 @@ class PythonEnvironmentExecutor(BaseExecutor):
         self, task: "BaseTask", script_path: str
     ) -> str:
         """Return a Python runtime invocation inside the environment."""
-        return (
-            f"{shlex.quote(self._python_bin(task))} {shlex.quote(script_path)}"
-        )
+        python_bin = shlex.quote(self._python_bin(task))
+        return f"{_READY} && {python_bin} {shlex.quote(script_path)}"
 
     def _setup_commands(self, task: "BaseTask") -> list[str]:
         """Return all shell commands required before the runtime executes."""
@@ -226,7 +230,7 @@ class PythonEnvironmentExecutor(BaseExecutor):
         """Prepare the task runtime and return its environment command."""
         if isinstance(task.runtime, CommandRuntime):
             command = await task.runtime.setup_runtime(task)
-            return self._run_command(task, command)
+            return self._run_command(task, f"{_READY} && {command}")
 
         if isinstance(task.runtime, PythonCodeStringRuntime):
             code = await task.runtime.setup_runtime(task)
@@ -280,9 +284,14 @@ class PythonEnvironmentExecutor(BaseExecutor):
             env=env,
         )
 
+        ready = False
         try:
             async with aclosing(proc.stream()) as stream:
                 async for stream_name, line in stream:
+                    if stream_name == "stdout" and not ready:
+                        ready = line.rstrip() == _READY_MARKER.encode()
+                        if ready:
+                            continue
                     if stream_name == "stdout":
                         horus_logger.log.info(line.decode("utf-8").rstrip())
                     elif stream_name == "stderr":
@@ -295,6 +304,11 @@ class PythonEnvironmentExecutor(BaseExecutor):
         # Draining the stream hits EOF but doesn't reap the process; wait() is
         # what yields a reliable returncode (matches ShellExecutor).
         returncode = await proc.wait()
+        if returncode != 0 and not ready:
+            raise TaskExecutionError(
+                _("Python environment setup failed with return code %(code)s")
+                % {"code": returncode}
+            )
         if returncode != 0:
             raise CommandFailedError(
                 _(
@@ -506,7 +520,8 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
         self, task: "BaseTask", script_path: str
     ) -> str:
         """Run a Python script with the Conda environment's interpreter."""
-        return self._in_environment(task, f"python {shlex.quote(script_path)}")
+        run = f"{_READY} && exec python {shlex.quote(script_path)}"
+        return self._in_environment(task, f"/bin/sh -c {shlex.quote(run)}")
 
 
 class UvPythonEnvironmentExecutor(PythonEnvironmentExecutor):
