@@ -46,6 +46,15 @@ wheels = [
 ]
 
 [[package]]
+name = "cloudpickle"
+version = "3.1.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/27/fb/576f067976d320f5f0114a8d9fa1215425441bb35627b1993e5afd8111e5/cloudpickle-3.1.2.tar.gz", hash = "sha256:7fda9eb655c9c230dab534f1983763de5835249750e85fbcef43aaa30a9a2414", size = 22330, upload-time = "2025-11-03T09:25:26.604Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/88/39/799be3f2f0f38cc727ee3b4f1445fe6d5e4133064ec2e4115069418a5bb6/cloudpickle-3.1.2-py3-none-any.whl", hash = "sha256:9acb47f6afd73f60dc1df93bb801b472f05ff42fa6c84167d25cb206be1fbf4a", size = 22228, upload-time = "2025-11-03T09:25:25.534Z" },
+]
+
+[[package]]
 name = "colorama"
 version = "0.4.6"
 source = { registry = "https://pypi.org/simple" }
@@ -174,7 +183,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "horus-runtime", specifier = ">=0.1.4" }]
+requires-dist = [{ name = "horus-runtime", specifier = ">=0.9.0" }]
 
 [package.metadata.requires-dev]
 dev = [
@@ -191,19 +200,20 @@ dev = [
 
 [[package]]
 name = "horus-runtime"
-version = "0.1.4"
+version = "0.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
+    { name = "cloudpickle" },
     { name = "loguru" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "pyyaml" },
     { name = "rich" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/47/da/46cc7311d9dd3bef5063f75e683961baf105162d0e93036c7172699d2592/horus_runtime-0.1.4.tar.gz", hash = "sha256:2cc76764808c122c0001928356aa87708fbc528d2cc852b600b671fd56677bf6", size = 136096, upload-time = "2026-07-01T21:30:49.284Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3c/71/77ed8a1a59b520da212d5528ad8eb398423dc499aee1cbf095bc2560e309/horus_runtime-0.9.0.tar.gz", hash = "sha256:02dc103aad16014e03c21261c35d0382def9825ae78c7d0b26dfb3a3fc0a9a02", size = 447722, upload-time = "2026-11-07T09:30:24.476Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2e/59/a990b0e48b1cf3c25b365fd251041c5e87ddae904612f5088c284db3ab5e/horus_runtime-0.1.4-py3-none-any.whl", hash = "sha256:d4c2267ededaa8b3b21fddd064adf4f8e71bd4a9f38ad598a76ff0a2fc7e62d9", size = 158199, upload-time = "2026-07-01T21:30:47.703Z" },
+    { url = "https://files.pythonhosted.org/packages/fd/3d/c4cbd9bb130b082aaecf865a0217e5c4dc5685e01acbb7424cea2456b5d0/horus_runtime-0.9.0-py3-none-any.whl", hash = "sha256:e313ad94fad1e6cc8439a78d50c8354e8252bd9775b669f681f3f716dac81fa9", size = 362806, upload-time = "2026-11-07T09:30:22.726Z" },
 ]
 
 [[package]]

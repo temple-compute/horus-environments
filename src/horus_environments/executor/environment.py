@@ -13,7 +13,10 @@ from horus_builtin.runtime.command import CommandRuntime
 from horus_builtin.runtime.python_string import PythonCodeStringRuntime
 from horus_builtin.runtime.substitution import is_template, substitute
 from horus_runtime.core.executor.base import BaseExecutor, RuntimeFilterType
-from horus_runtime.core.task.exceptions import TaskExecutionError
+from horus_runtime.core.task.exceptions import (
+    CommandFailedError,
+    TaskExecutionError,
+)
 from horus_runtime.logging import horus_logger
 from horus_runtime.settings import runtime_settings
 from pydantic import Field
@@ -22,6 +25,12 @@ from horus_environments.i18n import tr as _
 
 if TYPE_CHECKING:
     from horus_runtime.core.task.base import BaseTask
+
+# Printed right before the task's own command, so a non-zero exit without it
+# is a setup failure, not the command's exit code. The leading newline keeps
+# it on its own line when setup leaves a partial line on stdout.
+_READY_MARKER = "__horus_environment_ready__"
+_READY = f"printf '\\n%s\\n' {_READY_MARKER}"
 
 
 class PythonEnvironmentExecutor(BaseExecutor):
@@ -185,9 +194,8 @@ class PythonEnvironmentExecutor(BaseExecutor):
         self, task: "BaseTask", script_path: str
     ) -> str:
         """Return a Python runtime invocation inside the environment."""
-        return (
-            f"{shlex.quote(self._python_bin(task))} {shlex.quote(script_path)}"
-        )
+        python_bin = shlex.quote(self._python_bin(task))
+        return f"{_READY} && {python_bin} {shlex.quote(script_path)}"
 
     def _setup_commands(self, task: "BaseTask") -> list[str]:
         """Return all shell commands required before the runtime executes."""
@@ -223,7 +231,7 @@ class PythonEnvironmentExecutor(BaseExecutor):
         """Prepare the task runtime and return its environment command."""
         if isinstance(task.runtime, CommandRuntime):
             command = await task.runtime.setup_runtime(task)
-            return self._run_command(task, command)
+            return self._run_command(task, f"{_READY} && {command}")
 
         if isinstance(task.runtime, PythonCodeStringRuntime):
             code = await task.runtime.setup_runtime(task)
@@ -277,9 +285,15 @@ class PythonEnvironmentExecutor(BaseExecutor):
             env=env,
         )
 
+        ready = False
         try:
             async with aclosing(proc.stream()) as stream:
                 async for stream_name, line in stream:
+                    if stream_name == "stdout" and not ready:
+                        ready = line.rstrip() == _READY_MARKER.encode()
+                        # Also drops the blank line the marker's newline adds.
+                        if ready or not line.strip():
+                            continue
                     if stream_name == "stdout":
                         horus_logger.log.info(line.decode("utf-8").rstrip())
                     elif stream_name == "stderr":
@@ -291,14 +305,20 @@ class PythonEnvironmentExecutor(BaseExecutor):
 
         # Draining the stream hits EOF but doesn't reap the process; wait() is
         # what yields a reliable returncode (matches ShellExecutor).
-        await proc.wait()
-        if proc.returncode != 0:
+        returncode = await proc.wait()
+        if returncode != 0 and not ready:
             raise TaskExecutionError(
+                _("Python environment setup failed with return code %(code)s")
+                % {"code": returncode}
+            )
+        if returncode != 0:
+            raise CommandFailedError(
                 _(
                     "Python environment command exited with return code "
                     "%(code)s"
                 )
-                % {"code": proc.returncode}
+                % {"code": returncode},
+                returncode,
             )
 
 
@@ -502,7 +522,8 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
         self, task: "BaseTask", script_path: str
     ) -> str:
         """Run a Python script with the Conda environment's interpreter."""
-        return self._in_environment(task, f"python {shlex.quote(script_path)}")
+        run = f"{_READY} && exec python {shlex.quote(script_path)}"
+        return self._in_environment(task, f"/bin/sh -c {shlex.quote(run)}")
 
 
 class UvPythonEnvironmentExecutor(PythonEnvironmentExecutor):
