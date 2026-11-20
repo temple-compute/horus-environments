@@ -31,7 +31,7 @@ All backends share these fields:
 | --- | --- | --- |
 | `requirements` | `[]` | Packages pip-installed into the env |
 | `env` | `{}` | Extra environment variables for the process |
-| `environment_dir` | `.horus_python_environment` | Env location, relative to the task working dir |
+| `environment_dir` | `.horus_python_environment` | Env location, relative to the task working dir. Left at the default, the env is shared (see below) |
 | `recreate` | `false` | Wipe and rebuild the env before running |
 
 Backend-specific:
@@ -43,10 +43,19 @@ Backend-specific:
 - **uv** — `uv` (executable, default `"uv"`), `python` (interpreter or version)
 - **virtualenv** — `python` (interpreter used to build the venv, default `"python"`)
 
-If the env already exists (and, when you pin a version, the interpreter matches),
-it is reused instead of rebuilt. `conda_requirements` are baked into `conda
-create`, so they resolve once at provisioning time — change them with
-`recreate: true` to force a rebuild. Set `conda` to `mamba` or `micromamba` if
+With the default `environment_dir`, the env is shared across tasks and runs: it
+lives in `$HORUS_ENV_ROOT` on the target (else `.horus_envs` in the target
+working directory), in a `conda-<hash>` or `venv-<hash>` directory keyed by
+the backend, `requirements`, interpreter, conda packages and channels, and the
+`environment_file` content. Any change builds a new env. A shared env is reused
+only once it is fully built (`.horus-ready` inside it); an interrupted build is
+wiped and rebuilt. Pip does not run again on reuse.
+
+With an explicit `environment_dir`, an existing env (and, when you pin a
+version, a matching interpreter) is reused instead of rebuilt.
+`conda_requirements` are baked into `conda create`, so they resolve once at
+provisioning time — change them with `recreate: true` to force a rebuild.
+Set `conda` to `mamba` or `micromamba` if
 that's your executable — the executor detects them and drops the conda-only
 `--no-capture-output` flag they don't understand. (`conda env create -f` is
 conda/mamba syntax; micromamba uses `micromamba create -f`.)
