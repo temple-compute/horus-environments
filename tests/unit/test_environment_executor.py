@@ -1,9 +1,12 @@
 """Unit tests for Python environment executors."""
 
 import asyncio
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -19,6 +22,7 @@ from horus_runtime.core.task.exceptions import (
 )
 
 from horus_environments.executor.environment import (
+    _ENV_PROBE,
     CondaPythonEnvironmentExecutor,
     PythonEnvironmentExecutor,
     UvPythonEnvironmentExecutor,
@@ -26,6 +30,7 @@ from horus_environments.executor.environment import (
 )
 
 _NONZERO_CODE = 7
+_DIGEST_LEN = 32
 
 
 def _make_mock_proc(
@@ -49,14 +54,42 @@ def _make_mock_proc(
     return proc
 
 
-def _make_mock_target(proc: AsyncMock | None = None) -> MagicMock:
+_PROBE = _ENV_PROBE
+
+
+def _probe_output(env_root: str = "", *, lock: bool = True) -> bytes:
+    """Return what the env probe prints on a target."""
+    out = f"__horus_env_root__{env_root}\n"
+    if lock:
+        out += "__horus_env_lock__\n"
+    return out.encode()
+
+
+def _make_mock_target(
+    proc: AsyncMock | None = None,
+    env_root: str = "",
+    probe: AsyncMock | None = None,
+) -> MagicMock:
     """Return a mock target whose channel methods are async."""
     target = MagicMock()
     target.resolved_working_directory = "/tmp/horus"
     target.mkdir = AsyncMock()
     target.put_file = AsyncMock()
-    target.run_command = AsyncMock(return_value=proc or _make_mock_proc())
+    task_proc = proc or _make_mock_proc()
+
+    def _run_command(command: str, **_kwargs: object) -> AsyncMock:
+        if command == _PROBE:
+            return probe or _make_mock_proc(stdout=_probe_output(env_root))
+        return task_proc
+
+    target.run_command = AsyncMock(side_effect=_run_command)
     return target
+
+
+def _task_command(target: MagicMock) -> str:
+    """Return the task command sent to the mock target (not the probe)."""
+    commands = [c.args[0] for c in target.run_command.call_args_list]
+    return str(next(c for c in reversed(commands) if c != _PROBE))
 
 
 def _run_in_shell(command: str, **_kwargs: object) -> AsyncMock:
@@ -365,8 +398,10 @@ class TestEnvironmentExecutorExecute:
 
         expected_working_dir = "/tmp/horus/task-1"
         target.mkdir.assert_called_once_with(expected_working_dir)
-        target.run_command.assert_called_once()
-        command = target.run_command.call_args[0][0]
+        commands = [c.args[0] for c in target.run_command.call_args_list]
+        assert commands[0] == _PROBE
+        assert len(commands[1:]) == 1
+        command = _task_command(target)
         assert "python -m venv" in command
         assert "-m pip install rich" in command
         assert "/bin/sh -c" in command
@@ -479,9 +514,9 @@ class TestEnvironmentExecutorExecute:
         target.put_file.assert_called_once_with(
             b"print('hi')", "/tmp/horus/task-2/.horus_python_runtime.py"
         )
-        command = target.run_command.call_args[0][0]
+        command = _task_command(target)
         assert "uv venv" in command
-        assert ".horus_python_environment/bin/python" in command
+        assert "/tmp/horus/.horus_envs/venv-" in command
         assert ".horus_python_runtime.py" in command
 
     @pytest.mark.asyncio
@@ -755,3 +790,456 @@ class TestCondaEnvironmentFileResolution:
 
         with pytest.raises(TaskExecutionError, match="missing_id"):
             executor._remote_environment_file(task)
+
+
+async def _shared_path(
+    executor: PythonEnvironmentExecutor,
+    env_root: str = "/envs",
+    task: HorusTask | None = None,
+    probe: AsyncMock | None = None,
+) -> str:
+    """Resolve and return the shared environment path for a task."""
+    task = task or _make_command_task(executor)
+    target = _make_mock_target(env_root=env_root, probe=probe)
+    with patch.object(task, "target", target):
+        await executor._resolve_shared_environment(task)
+    return executor._environment_path(task)
+
+
+@pytest.mark.unit
+class TestSharedEnvironment:
+    """The default environment_dir is shared and keyed by the env spec."""
+
+    async def test_same_spec_same_dir(self) -> None:
+        """Two tasks with the same spec resolve to one shared env."""
+        spec: dict[str, Any] = {
+            "python_version": "3.12",
+            "conda_requirements": ["vina"],
+        }
+        first = await _shared_path(CondaPythonEnvironmentExecutor(**spec))
+        second = await _shared_path(CondaPythonEnvironmentExecutor(**spec))
+
+        assert first == second
+        assert first.startswith("/envs/conda-")
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"python_version": "3.11"},
+            {"conda_requirements": ["vina", "rdkit"]},
+            {"channels": ["bioconda"]},
+            {"requirements": ["pandas"]},
+            {"conda": "micromamba"},
+        ],
+    )
+    async def test_different_spec_different_dir(
+        self, change: dict[str, Any]
+    ) -> None:
+        """Any spec change gives a new env instead of reusing the old one."""
+        spec: dict[str, Any] = {
+            "python_version": "3.12",
+            "conda_requirements": ["vina"],
+        }
+        base = await _shared_path(CondaPythonEnvironmentExecutor(**spec))
+        changed = await _shared_path(
+            CondaPythonEnvironmentExecutor(**{**spec, **change})
+        )
+
+        assert base != changed
+
+    async def test_spec_hash_is_stable(self) -> None:
+        """
+        The hash of a fixed spec never changes: a change orphans every
+        shared env already built on disk.
+        """
+        path = await _shared_path(
+            VirtualenvPythonEnvironmentExecutor(requirements=["numpy==2.1.0"])
+        )
+
+        assert path == "/envs/venv-e161894a1261247a3d8801af704d5dc7"
+
+    @pytest.mark.skipif(shutil.which("flock") is None, reason="no flock")
+    def test_concurrent_setups_build_once(self, tmp_path: Path) -> None:
+        """Two tasks set up the same shared env at once: one build."""
+        executor = VirtualenvPythonEnvironmentExecutor()
+        task = _make_command_task(executor)
+        env_dir = tmp_path / "venv-test"
+        python = env_dir / "bin" / "python"
+        executor._shared_paths[task.id] = str(env_dir)
+        log = tmp_path / "log"
+        create = (
+            f"sleep 0.5 && mkdir -p {env_dir}/bin && : > {python}"
+            f" && chmod +x {python} && echo create >> {log}"
+        )
+
+        with patch.object(
+            VirtualenvPythonEnvironmentExecutor,
+            "_create_command",
+            return_value=create,
+        ):
+            command = executor._locked_setup_command(task)
+        procs = [
+            subprocess.Popen(["/bin/sh", "-c", command]) for _ in range(2)
+        ]
+
+        assert [proc.wait() for proc in procs] == [0, 0]
+        assert log.read_text().split() == ["create"]
+        subprocess.run(["chmod", "-R", "u+w", str(env_dir)], check=True)
+
+    async def test_executor_env_is_hashed(self) -> None:
+        """A different index or conda override gives a new env."""
+        base = await _shared_path(UvPythonEnvironmentExecutor())
+        index = await _shared_path(
+            UvPythonEnvironmentExecutor(env={"PIP_INDEX_URL": "https://a"})
+        )
+        cuda = await _shared_path(
+            UvPythonEnvironmentExecutor(env={"CONDA_OVERRIDE_CUDA": "12.4"})
+        )
+
+        assert base != index
+        assert base != cuda
+        assert index != cuda
+
+    async def test_target_installer_vars_are_hashed(self) -> None:
+        """Installer variables set on the target give a new env."""
+        plain = _make_mock_proc(stdout=_probe_output("/envs"))
+        mirror = _make_mock_proc(
+            stdout=_probe_output("/envs")
+            + b"__horus_env_var__PIP_INDEX_URL=https://mirror\n"
+        )
+
+        first = await _shared_path(
+            VirtualenvPythonEnvironmentExecutor(), probe=plain
+        )
+        second = await _shared_path(
+            VirtualenvPythonEnvironmentExecutor(), probe=mirror
+        )
+
+        assert first != second
+
+    @pytest.mark.parametrize(
+        "requirement",
+        [".", "./pkg", "-e .", "-r requirements.txt", "pkg @ file:///x"],
+    )
+    async def test_local_requirements_are_not_shared(
+        self, requirement: str
+    ) -> None:
+        """A requirement whose content the hash cannot see stays per task."""
+        executor = UvPythonEnvironmentExecutor(requirements=[requirement])
+        task = _make_command_task(executor)
+
+        path = await _shared_path(executor, task=task)
+
+        assert path == f"{task.working_dir}/.horus_python_environment"
+        assert "--no-config" not in " ".join(executor._setup_commands(task))
+
+    async def test_environment_file_with_local_refs_is_not_shared(
+        self, tmp_path: Path
+    ) -> None:
+        """An env file that pulls in other files stays per task."""
+        env_yaml = tmp_path / "environment.yaml"
+        env_yaml.write_text(
+            "dependencies:\n  - pip\n  - pip:\n    - -r requirements.txt\n"
+        )
+        executor = CondaPythonEnvironmentExecutor(
+            environment_file=str(env_yaml)
+        )
+        task = _make_command_task(executor)
+
+        path = await _shared_path(executor, task=task)
+
+        assert path == f"{task.working_dir}/.horus_python_environment"
+
+    async def test_shared_uv_ignores_config_files(self) -> None:
+        """A shared uv build does not read uv config from the task dir."""
+        executor = UvPythonEnvironmentExecutor(requirements=["numpy"])
+        task = _make_command_task(executor)
+        await _shared_path(executor, task=task)
+
+        setup = " ".join(executor._setup_commands(task))
+
+        assert "uv venv --no-config /envs/venv-" in setup
+        assert "uv pip install --no-config --python /envs/venv-" in setup
+
+    async def test_environment_file_content_is_hashed(
+        self, tmp_path: Path
+    ) -> None:
+        """A one-line change in the env file gives a new env."""
+        env_yaml = tmp_path / "environment.yaml"
+        executor = CondaPythonEnvironmentExecutor(
+            environment_file=str(env_yaml)
+        )
+        env_yaml.write_text("dependencies: [python=3.12]\n")
+        before = await _shared_path(executor)
+        env_yaml.write_text("dependencies: [python=3.13]\n")
+        after = await _shared_path(executor)
+
+        assert before != after
+
+    async def test_artifact_environment_file_is_read_on_target(
+        self, tmp_path: Path
+    ) -> None:
+        """An env file given as an artifact is read from the target."""
+        staged = tmp_path / "conda_env.yaml"
+        executor = CondaPythonEnvironmentExecutor(
+            environment_file="${conda_env}"
+        )
+        task = HorusTask(
+            id="task-1",
+            name="task_1",
+            executor=executor,
+            runtime=CommandRuntime(command="python --version"),
+            inputs=[FileArtifact(id="conda_env", path=staged)],
+        )
+        target = _make_mock_target(env_root="/envs")
+        target.path_on_target = MagicMock(return_value=str(staged))
+        target.get_file = AsyncMock(return_value=b"dependencies: []\n")
+
+        with patch.object(task, "target", target):
+            await executor._resolve_shared_environment(task)
+
+        target.get_file.assert_awaited_once_with(str(staged))
+        assert executor._environment_path(task).startswith("/envs/conda-")
+
+    async def test_backends_do_not_share_a_dir(self) -> None:
+        """Uv and stdlib venvs with the same requirements stay apart."""
+        uv = await _shared_path(UvPythonEnvironmentExecutor())
+        venv = await _shared_path(VirtualenvPythonEnvironmentExecutor())
+
+        assert uv.startswith("/envs/venv-")
+        assert uv != venv
+
+    async def test_env_root_falls_back_to_target_working_dir(self) -> None:
+        """Without HORUS_ENV_ROOT the env lives in the target working dir."""
+        path = await _shared_path(CondaPythonEnvironmentExecutor(), "")
+
+        assert path.startswith("/tmp/horus/.horus_envs/conda-")
+
+    @pytest.mark.parametrize(
+        ("stdout", "returncode", "expected"),
+        [
+            # rc noise before the sentinel is ignored
+            (b"motd\n" + _probe_output("/envs"), 0, "/envs/venv-"),
+            (_probe_output("/"), 0, "/venv-"),
+            (_probe_output("envs"), 0, "/tmp/horus/.horus_envs/venv-"),
+            (_probe_output("/envs", lock=False), 0, None),
+            (_probe_output("/envs"), 1, None),
+        ],
+    )
+    async def test_probe_output(
+        self, stdout: bytes, returncode: int, expected: str | None
+    ) -> None:
+        """
+        Only the sentinel line sets the root; a relative root falls back to
+        the working dir; no flock or a failed probe keeps the env per task.
+        """
+        executor = VirtualenvPythonEnvironmentExecutor()
+        task = _make_command_task(executor)
+        probe = _make_mock_proc(returncode, stdout)
+
+        path = await _shared_path(executor, task=task, probe=probe)
+
+        if expected is None:
+            assert path == f"{task.working_dir}/.horus_python_environment"
+        else:
+            assert path.startswith(expected)
+            assert len(path.rpartition("venv-")[2]) == _DIGEST_LEN
+
+    async def test_explicit_environment_dir_is_not_shared(self) -> None:
+        """An explicit environment_dir keeps per-task behaviour."""
+        executor = CondaPythonEnvironmentExecutor(environment_dir="/opt/env")
+        task = _make_command_task(executor)
+        target = _make_mock_target(env_root="/envs")
+
+        with patch.object(task, "target", target):
+            await executor._resolve_shared_environment(task)
+
+        target.run_command.assert_not_awaited()
+        assert executor._environment_path(task) == "/opt/env"
+        assert ".horus-ready" not in " ".join(executor._setup_commands(task))
+
+    def test_ready_marker_gates_reuse_and_pip(self, tmp_path: Path) -> None:
+        """
+        Only a ready env with its interpreter is reused, without pip, and is
+        read-only; a killed or failed build or a lost interpreter is wiped
+        and rebuilt.
+        """
+        executor = VirtualenvPythonEnvironmentExecutor(requirements=["x"])
+        task = _make_command_task(executor)
+        env_dir = tmp_path / "venv-test"
+        python = env_dir / "bin" / "python"
+        executor._shared_paths[task.id] = str(env_dir)
+        log = tmp_path / "log"
+        pip = tmp_path / "pip_fails"
+
+        def setup() -> int:
+            command = executor._locked_setup_command(task)
+            return subprocess.run(
+                ["/bin/sh", "-c", command], check=False
+            ).returncode
+
+        def unlock() -> None:
+            subprocess.run(["chmod", "-R", "u+w", str(env_dir)], check=True)
+
+        create = (
+            f"mkdir -p {env_dir}/bin && : > {python} && chmod +x {python}"
+            f" && echo create >> {log}"
+        )
+        with (
+            patch.object(
+                VirtualenvPythonEnvironmentExecutor,
+                "_create_command",
+                return_value=create,
+            ),
+            patch.object(
+                VirtualenvPythonEnvironmentExecutor,
+                "_pip_install_command",
+                return_value=f"echo pip >> {log} && [ ! -e {pip} ]",
+            ),
+        ):
+            # Killed mid-build: the dir exists but was never marked ready.
+            env_dir.mkdir()
+            (env_dir / "partial").touch()
+            assert setup() == 0
+            assert not (env_dir / "partial").exists()
+            assert (env_dir / ".horus-ready").exists()
+            assert env_dir.stat().st_mode & 0o222 == 0
+            assert setup() == 0
+            assert log.read_text().split() == ["create", "pip"]
+
+            # A failed pip step leaves no marker, so the next run rebuilds.
+            log.unlink()
+            unlock()
+            (env_dir / ".horus-ready").unlink()
+            pip.touch()
+            assert setup() != 0
+            assert not (env_dir / ".horus-ready").exists()
+            pip.unlink()
+            assert setup() == 0
+            assert log.read_text().split() == ["create", "pip"] * 2
+
+            # Marked ready but the interpreter is gone: rebuilt.
+            log.unlink()
+            unlock()
+            python.unlink()
+            subprocess.run(["chmod", "-R", "a-w", str(env_dir)], check=True)
+            assert setup() == 0
+            assert python.exists()
+            assert log.read_text().split() == ["create", "pip"]
+            unlock()
+
+    def test_rebuild_moves_aside_an_env_it_cannot_delete(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A ready env built by another uid of the group (read-only, not ours to
+        chmod) that lost its interpreter is moved aside and rebuilt.
+        """
+        executor = VirtualenvPythonEnvironmentExecutor()
+        task = _make_command_task(executor)
+        env_dir = tmp_path / "venv-test"
+        python = env_dir / "bin" / "python"
+        executor._shared_paths[task.id] = str(env_dir)
+        real_chmod = shutil.which("chmod")
+        assert real_chmod is not None
+        # Not the owner: chmod u+w has no effect.
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        (fake_bin / "chmod").write_text(
+            f'#!/bin/sh\n[ "$2" = u+w ] && exit 0\nexec {real_chmod} "$@"\n'
+        )
+        (fake_bin / "chmod").chmod(0o755)
+        (env_dir / "bin").mkdir(parents=True)
+        (env_dir / ".horus-ready").touch()
+        subprocess.run([real_chmod, "-R", "a-w", str(env_dir)], check=True)
+        create = f"mkdir -p {env_dir}/bin && : > {python} && chmod +x {python}"
+
+        with patch.object(
+            VirtualenvPythonEnvironmentExecutor,
+            "_create_command",
+            return_value=create,
+        ):
+            command = executor._locked_setup_command(task)
+        result = subprocess.run(
+            ["/bin/sh", "-c", command],
+            check=False,
+            env={"PATH": f"{fake_bin}:/usr/bin:/bin"},
+        )
+
+        try:
+            assert result.returncode == 0
+            assert python.exists()
+            assert (env_dir / ".horus-ready").exists()
+            assert env_dir.stat().st_mode & 0o222 == 0
+            stale = list(tmp_path.glob("venv-test.stale.*"))
+            if os.geteuid() != 0:
+                assert [(s / ".horus-ready").exists() for s in stale] == [True]
+        finally:
+            subprocess.run(
+                [real_chmod, "-R", "u+w", str(tmp_path)], check=True
+            )
+
+    def test_shared_build_copies_from_package_caches(
+        self, tmp_path: Path
+    ) -> None:
+        """A shared build never hard-links files from an installer cache."""
+        executor = CondaPythonEnvironmentExecutor()
+        task = _make_command_task(executor)
+        env_dir = tmp_path / "conda-test"
+        python = env_dir / "bin" / "python"
+        executor._shared_paths[task.id] = str(env_dir)
+        log = tmp_path / "log"
+        create = (
+            f"mkdir -p {env_dir}/bin && : > {python} && chmod +x {python}"
+            f' && echo "$CONDA_ALWAYS_COPY $MAMBA_ALWAYS_COPY $UV_LINK_MODE"'
+            f" > {log}"
+        )
+
+        with patch.object(
+            CondaPythonEnvironmentExecutor,
+            "_create_command",
+            return_value=create,
+        ):
+            command = executor._locked_setup_command(task)
+        subprocess.run(["/bin/sh", "-c", command], check=True)
+
+        assert log.read_text().split() == ["true", "true", "copy"]
+        subprocess.run(["chmod", "-R", "u+w", str(env_dir)], check=True)
+
+    async def test_recreate_builds_in_task_dir(self) -> None:
+        """recreate: true never wipes the shared env, it builds per task."""
+        executor = VirtualenvPythonEnvironmentExecutor(recreate=True)
+        task = _make_command_task(executor)
+        executor._shared_paths[task.id] = "/envs/venv-stale"
+        target = _make_mock_target(env_root="/envs")
+
+        with patch.object(task, "target", target):
+            await executor._resolve_shared_environment(task)
+
+        target.run_command.assert_not_awaited()
+        path = executor._environment_path(task)
+        assert path == f"{task.working_dir}/.horus_python_environment"
+        setup = " ".join(executor._setup_commands(task))
+        assert "/envs/" not in setup
+        assert f"rm -rf {path}" in setup
+
+    @pytest.mark.asyncio
+    async def test_execute_builds_in_horus_env_root(
+        self, horus_context: HorusContext
+    ) -> None:
+        """_execute probes HORUS_ENV_ROOT and builds the env there."""
+        del horus_context
+        executor = CondaPythonEnvironmentExecutor()
+        task = _make_command_task(executor)
+        target = _make_mock_target(env_root="/cache/org/conda-envs")
+
+        with patch.object(task, "target", target):
+            await executor._execute(task)
+
+        probe = target.run_command.call_args_list[0]
+        assert probe.args[0] == _PROBE
+        assert probe.kwargs["detach"] is False
+        command = _task_command(target)
+        assert "flock /cache/org/conda-envs/conda-" in command
+        assert "conda create -y -p /cache/org/conda-envs/conda-" in command
+        assert ".horus_python_environment" not in command

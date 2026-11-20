@@ -31,8 +31,8 @@ All backends share these fields:
 | --- | --- | --- |
 | `requirements` | `[]` | Packages pip-installed into the env |
 | `env` | `{}` | Extra environment variables for the process |
-| `environment_dir` | `.horus_python_environment` | Env location, relative to the task working dir |
-| `recreate` | `false` | Wipe and rebuild the env before running |
+| `environment_dir` | `.horus_python_environment` | Env location, relative to the task working dir. Left at the default, the env is shared (see below) |
+| `recreate` | `false` | Wipe and rebuild the env before running. With the default `environment_dir`, the env is built in the task working dir instead of the shared one |
 
 Backend-specific:
 
@@ -43,10 +43,34 @@ Backend-specific:
 - **uv** — `uv` (executable, default `"uv"`), `python` (interpreter or version)
 - **virtualenv** — `python` (interpreter used to build the venv, default `"python"`)
 
-If the env already exists (and, when you pin a version, the interpreter matches),
-it is reused instead of rebuilt. `conda_requirements` are baked into `conda
-create`, so they resolve once at provisioning time — change them with
-`recreate: true` to force a rebuild. Set `conda` to `mamba` or `micromamba` if
+With the default `environment_dir`, the env is shared across tasks and runs: it
+lives in `$HORUS_ENV_ROOT` on the target (else `.horus_envs` in the target
+working directory), in a `conda-<hash>` or `venv-<hash>` directory keyed by
+the backend, `requirements`, interpreter, conda packages and channels, the
+`environment_file` content, `env`, and the `PIP_*`, `UV_*`, `CONDA*` and
+`MAMBA*` variables on the target. Any change builds a new env. A shared env is
+reused only once it is fully built (`.horus-ready` inside it) and its
+interpreter exists; otherwise it is moved to `<env>.stale.<pid>` and rebuilt
+(a leftover owned by another user stays there). Pip does not run again
+on reuse, and a ready env is read-only: task commands must not install into it.
+Its files are copies, not hard links into the conda, mamba or uv package cache.
+
+Pin versions: a shared env keeps the versions of its first build. To rebuild,
+change the spec or set `environment_dir`.
+
+The env stays per task when the target has no `flock`, or when `requirements`
+or the `environment_file` refer to local paths, URLs or pip options (`.`,
+`-e`, `-r`, `pkg @ file:...`), since the hash cannot see their content.
+
+`HORUS_ENV_ROOT` is read from the target's environment, not from `env`. It is
+set by whoever runs the target; a platform that lets users define environment
+variables or secrets for their tasks should reserve this name.
+
+With an explicit `environment_dir`, an existing env (and, when you pin a
+version, a matching interpreter) is reused instead of rebuilt.
+`conda_requirements` are baked into `conda create`, so they resolve once at
+provisioning time — change them with `recreate: true` to force a rebuild.
+Set `conda` to `mamba` or `micromamba` if
 that's your executable — the executor detects them and drops the conda-only
 `--no-capture-output` flag they don't understand. (`conda env create -f` is
 conda/mamba syntax; micromamba uses `micromamba create -f`.)

@@ -3,6 +3,8 @@ Python environment executors for Horus tasks.
 """
 
 import asyncio
+import hashlib
+import json
 import re
 import shlex
 from contextlib import aclosing
@@ -19,7 +21,7 @@ from horus_runtime.core.task.exceptions import (
 )
 from horus_runtime.logging import horus_logger
 from horus_runtime.settings import runtime_settings
-from pydantic import Field
+from pydantic import Field, PrivateAttr
 
 from horus_environments.i18n import tr as _
 
@@ -31,6 +33,29 @@ if TYPE_CHECKING:
 # it on its own line when setup leaves a partial line on stdout.
 _READY_MARKER = "__horus_environment_ready__"
 _READY = f"printf '\\n%s\\n' {_READY_MARKER}"
+
+_DEFAULT_ENVIRONMENT_DIR = ".horus_python_environment"
+# Reports the env root, flock and the installer variables on the target.
+# Sentinels keep shell rc noise out of the parsed values.
+_ROOT_SENTINEL = "__horus_env_root__"
+_LOCK_SENTINEL = "__horus_env_lock__"
+_VAR_SENTINEL = "__horus_env_var__"
+_ENV_PROBE = (
+    f"printf '{_ROOT_SENTINEL}%s\\n' \"${{HORUS_ENV_ROOT-}}\";"
+    f" if command -v flock >/dev/null 2>&1; then echo {_LOCK_SENTINEL}; fi;"
+    " env | awk '/^(PIP_|UV_|CONDA|MAMBA)/"
+    f' {{ print "{_VAR_SENTINEL}" $0 }}\''
+)
+# Written into a shared environment once create and pip both succeed.
+_ENV_READY_FILE = ".horus-ready"
+
+
+def _is_local_requirement(requirement: str) -> bool:
+    """Return whether a requirement is a path, URL or pip option."""
+    requirement = requirement.strip()
+    return requirement.startswith((".", "-", "~")) or any(
+        char in requirement for char in "/\\@:"
+    )
 
 
 class PythonEnvironmentExecutor(BaseExecutor):
@@ -47,7 +72,8 @@ class PythonEnvironmentExecutor(BaseExecutor):
 
     requirements: list[str] = Field(default_factory=list)
     """
-    Python package requirements installed into the environment with pip.
+    Python package requirements installed into the environment with pip. Pin
+    versions: a shared environment keeps the versions of its first build.
     """
 
     env: dict[str, str] = Field(default_factory=dict)
@@ -55,21 +81,87 @@ class PythonEnvironmentExecutor(BaseExecutor):
     Extra environment variables passed to the target process.
     """
 
-    environment_dir: str = ".horus_python_environment"
+    environment_dir: str = _DEFAULT_ENVIRONMENT_DIR
     """
-    Directory where the environment is created. A relative path is resolved
-    against the task working directory; an absolute path is used as-is
-    (e.g. to point at, and reuse, an environment that already exists on the
+    Directory where the environment is created. Left at the default (written
+    out or not), the environment is shared: it lives under
+    ``$HORUS_ENV_ROOT`` on the target (else ``.horus_envs`` in the target
+    working directory), in a directory named by a hash of its spec, and every
+    task with the same spec reuses it. ``HORUS_ENV_ROOT`` comes from the
+    target's environment, not from ``env``. A relative path is resolved
+    against the task working directory; an absolute path is used as-is (e.g.
+    to point at, and reuse, an environment that already exists on the
     target).
     """
 
     recreate: bool = False
     """
-    Recreate the environment before running the task.
+    Recreate the environment before running the task. With the default
+    ``environment_dir`` the env is then built in the task working directory
+    instead of the shared one, which is left untouched.
     """
+
+    _shared_prefix: ClassVar[str] = "venv"
+
+    # Task id -> shared environment path, set by _resolve_shared_environment.
+    _shared_paths: dict[str, str] = PrivateAttr(default_factory=dict)
+
+    async def _spec(self, task: "BaseTask") -> dict[str, object] | None:
+        """
+        Return what defines the built environment, hashed into its path, or
+        ``None`` when it depends on files the hash cannot see.
+        """
+        del task
+        if any(_is_local_requirement(req) for req in self.requirements):
+            return None
+        return {
+            "kind": self.kind,
+            "requirements": self.requirements,
+            "env": self.env,
+        }
+
+    async def _resolve_shared_environment(self, task: "BaseTask") -> None:
+        """Point the default ``environment_dir`` at the shared environment."""
+        self._shared_paths.pop(task.id, None)
+        # recreate wants a fresh env every run: build it in the task dir so a
+        # shared env is never wiped under the tasks running in it.
+        if self.environment_dir != _DEFAULT_ENVIRONMENT_DIR or self.recreate:
+            return
+        spec = await self._spec(task)
+        if spec is None:
+            return
+        probe = await task.target.run_command(_ENV_PROBE, detach=False)
+        out = (await probe.communicate())[0].decode(errors="replace")
+        lines = [line.strip() for line in out.splitlines()]
+        # Without flock, concurrent builds would mix in one dir: stay per task.
+        if await probe.wait() != 0 or _LOCK_SENTINEL not in lines:
+            return
+        root = next(
+            (
+                line.rpartition(_ROOT_SENTINEL)[2]
+                for line in reversed(lines)
+                if _ROOT_SENTINEL in line
+            ),
+            "",
+        )
+        if not root.startswith("/"):
+            root = f"{task.target.resolved_working_directory}/.horus_envs"
+        spec["target_env"] = sorted(
+            line.removeprefix(_VAR_SENTINEL)
+            for line in lines
+            if line.startswith(_VAR_SENTINEL)
+        )
+        encoded = json.dumps(spec, sort_keys=True).encode()
+        digest = hashlib.sha256(encoded).hexdigest()[:32]
+        self._shared_paths[task.id] = str(
+            PurePosixPath(root) / f"{self._shared_prefix}-{digest}"
+        )
 
     def _environment_path(self, task: "BaseTask") -> str:
         """Return the target-side path where the environment lives."""
+        shared = self._shared_paths.get(task.id)
+        if shared is not None:
+            return shared
         env_dir = Path(self.environment_dir)
         if env_dir.is_absolute():
             return str(env_dir)
@@ -85,7 +177,7 @@ class PythonEnvironmentExecutor(BaseExecutor):
         environment, and conda/mamba serialize on their package cache, so
         every clone pays for a full build. Under ``flock`` the first builds
         it and the rest wait, then reuse it. A target without ``flock``
-        runs the setup unlocked, as before.
+        gets no shared env and runs the per-task setup unlocked.
         """
         env_path = self._environment_path(task)
         setup = " && ".join(self._setup_commands(task))
@@ -179,11 +271,21 @@ class PythonEnvironmentExecutor(BaseExecutor):
             f" fi"
         )
 
+    def _create_command(self, task: "BaseTask") -> str:
+        """Return the shell command that creates the environment."""
+        raise NotImplementedError
+
+    def _requested_python_version(self) -> str | None:
+        """Return the ``major.minor`` an existing env must match, if any."""
+        return None
+
     def _create_environment_command(self, task: "BaseTask") -> str:
         """
         Return the shell command that ensures the environment exists.
         """
-        raise NotImplementedError
+        return self._reuse_or_create_command(
+            task, self._create_command(task), self._requested_python_version()
+        )
 
     def _run_command(self, task: "BaseTask", prepared_command: str) -> str:
         """Return a command runtime invocation inside the environment."""
@@ -199,33 +301,73 @@ class PythonEnvironmentExecutor(BaseExecutor):
 
     def _setup_commands(self, task: "BaseTask") -> list[str]:
         """Return all shell commands required before the runtime executes."""
-        commands: list[str] = []
         env_path = shlex.quote(self._environment_path(task))
-        if self.recreate:
-            commands.append(
-                self._log_command(
-                    _("Recreating Python environment at %(path)s")
-                    % {"path": self._environment_path(task)}
-                )
-            )
-            commands.append(f"rm -rf {env_path}")
-        commands.append(self._create_environment_command(task))
-        install = self._pip_install_command(task)
-        if install is not None:
-            commands.append(
-                self._log_command(
-                    _(
-                        "Installing %(count)d Python requirement(s) into "
-                        "%(path)s"
+        install = self._install_commands(task)
+        if task.id not in self._shared_paths:
+            commands: list[str] = []
+            if self.recreate:
+                commands.append(
+                    self._log_command(
+                        _("Recreating Python environment at %(path)s")
+                        % {"path": self._environment_path(task)}
                     )
-                    % {
-                        "count": len(self.requirements),
-                        "path": self._environment_path(task),
-                    }
                 )
-            )
-            commands.append(install)
-        return commands
+                commands.append(f"rm -rf {env_path}")
+            return [
+                *commands,
+                self._create_environment_command(task),
+                *install,
+            ]
+        # The spec is in the path, so a ready shared env is used as is. One
+        # without the marker is a killed or failed build, and one without its
+        # interpreter lost its base Python: both are rebuilt. A ready env is
+        # read-only so a task command cannot change it for the others. Another
+        # uid of the group cannot delete it then, but can rename it in the
+        # group-writable env root: move it aside, drop what can be dropped.
+        # Installers copy instead of hard-linking from their package cache:
+        # chmod would change the cached files, and another uid can neither
+        # link nor chmod them.
+        ready = shlex.quote(
+            f"{self._environment_path(task)}/{_ENV_READY_FILE}"
+        )
+        python_bin = shlex.quote(self._python_bin(task))
+        stale = f"{env_path}.stale."
+        build = " && ".join(
+            [
+                self._create_log_command(task),
+                f"if [ -e {env_path} ] || [ -L {env_path} ];"
+                f" then mv {env_path} {stale}$$; fi",
+                f"{{ chmod -R u+w {stale}* 2>/dev/null;"
+                f" rm -rf {stale}* 2>/dev/null; :; }}",
+                "export CONDA_ALWAYS_COPY=true MAMBA_ALWAYS_COPY=true"
+                " UV_LINK_MODE=copy",
+                self._create_command(task),
+                *install,
+                f"touch {ready}",
+                f"chmod -R a-w {env_path}",
+            ]
+        )
+        return [
+            f"if [ -f {ready} ] && [ -x {python_bin} ];"
+            f" then {self._reuse_log_command(task)};"
+            f" else {build}; fi"
+        ]
+
+    def _install_commands(self, task: "BaseTask") -> list[str]:
+        """Return the pip install log and command, if any requirements."""
+        install = self._pip_install_command(task)
+        if install is None:
+            return []
+        return [
+            self._log_command(
+                _("Installing %(count)d Python requirement(s) into %(path)s")
+                % {
+                    "count": len(self.requirements),
+                    "path": self._environment_path(task),
+                }
+            ),
+            install,
+        ]
 
     async def _runtime_command(self, task: "BaseTask") -> str:
         """Prepare the task runtime and return its environment command."""
@@ -261,6 +403,7 @@ class PythonEnvironmentExecutor(BaseExecutor):
         """
         await task.target.mkdir(task.working_dir)
         await self._stage_environment(task)
+        await self._resolve_shared_environment(task)
         run_command = await self._runtime_command(task)
         full_command = f"{self._locked_setup_command(task)} && {run_command}"
 
@@ -348,8 +491,9 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
     """
     Packages installed from conda channels (as opposed to the pip-installed
     ``requirements``). They are baked into the ``conda create`` line, so they
-    are resolved once when the environment is provisioned; change them with
-    ``recreate: true`` (or a fresh ``environment_dir``) to force a rebuild.
+    are resolved once when the environment is provisioned. With the default
+    ``environment_dir`` a change builds a new shared environment; with an
+    explicit one, use ``recreate: true`` to force a rebuild.
     """
 
     environment_file: str | None = None
@@ -368,6 +512,32 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
     the machine running Horus never needs a copy — this is how an imported
     workflow provisions its environment.
     """
+
+    _shared_prefix: ClassVar[str] = "conda"
+
+    async def _spec(self, task: "BaseTask") -> dict[str, object] | None:
+        """Add the conda flavour, packages and env file content."""
+        base = await super()._spec(task)
+        if base is None:
+            return None
+        spec = {
+            **base,
+            "conda": self.conda,
+            "python_version": self.python_version,
+            "channels": self.channels,
+            "conda_requirements": self.conda_requirements,
+        }
+        if self.environment_file is not None:
+            content = (
+                await task.target.get_file(self._remote_environment_file(task))
+                if is_template(self.environment_file)
+                else Path(self.environment_file).read_bytes()
+            )
+            # A list item that is a path or pip option refers to other files.
+            if re.search(rb"(?m)^\s*-\s+[-./~]|file:", content):
+                return None
+            spec["environment_file"] = hashlib.sha256(content).hexdigest()
+        return spec
 
     def anchor_local_paths(self, base: Path) -> None:
         """Resolve a relative ``environment_file`` against the workflow dir."""
@@ -423,21 +593,18 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
                 % {"path": self.environment_file}
             ) from exc
 
-    def _create_environment_command(self, task: "BaseTask") -> str:
+    def _create_command(self, task: "BaseTask") -> str:
         """Return the Conda environment creation command."""
         env_path = shlex.quote(self._environment_path(task))
         conda = shlex.quote(self.conda)
 
         if self.environment_file is not None:
-            create = (
+            return (
                 f"{conda} env create"
                 f" -f {shlex.quote(self._remote_environment_file(task))}"
                 f" -p {env_path}"
                 " -y"  # Auto-confirm the creation of the environment
             )
-            # The file owns the interpreter; reuse on existence (no version
-            # probe).
-            return self._reuse_or_create_command(task, create, None)
 
         parts = [f"{conda} create -y"]
         channels = self._channel_args()
@@ -451,14 +618,12 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
         )
         parts.append("pip")
         parts.extend(shlex.quote(req) for req in self.conda_requirements)
-        create = " ".join(parts)
-        return self._reuse_or_create_command(
-            task, create, self._requested_python_version()
-        )
+        return " ".join(parts)
 
     def _requested_python_version(self) -> str | None:
         """Return the requested ``major.minor`` version, if one was given."""
-        if self.python_version is None:
+        # The file owns the interpreter; reuse on existence (no version probe).
+        if self.environment_file is not None or self.python_version is None:
             return None
         match = re.search(
             r"(?<!\d)(\d+\.\d+)(?:\.\d+)?(?!\d)", self.python_version
@@ -549,6 +714,17 @@ class UvPythonEnvironmentExecutor(PythonEnvironmentExecutor):
         """Return a human-readable backend name for setup logs."""
         return "uv Python environment"
 
+    async def _spec(self, task: "BaseTask") -> dict[str, object] | None:
+        """Add the uv executable and requested interpreter."""
+        base = await super()._spec(task)
+        if base is None:
+            return None
+        return {**base, "uv": self.uv, "python": self.python}
+
+    def _config_flag(self, task: "BaseTask") -> str:
+        """Keep uv config files in the task dir out of a shared build."""
+        return " --no-config" if task.id in self._shared_paths else ""
+
     def _requested_python_version(self) -> str | None:
         """
         Return the requested major.minor version when it can be inferred.
@@ -558,15 +734,12 @@ class UvPythonEnvironmentExecutor(PythonEnvironmentExecutor):
         match = re.search(r"(?<!\d)(\d+\.\d+)(?:\.\d+)?(?!\d)", self.python)
         return match.group(1) if match else None
 
-    def _create_environment_command(self, task: "BaseTask") -> str:
+    def _create_command(self, task: "BaseTask") -> str:
         """Return the uv venv creation command."""
         env_path = shlex.quote(self._environment_path(task))
         uv = shlex.quote(self.uv)
         python = f" --python {shlex.quote(self.python)}" if self.python else ""
-        create = f"{uv} venv{python} {env_path}"
-        return self._reuse_or_create_command(
-            task, create, self._requested_python_version()
-        )
+        return f"{uv} venv{self._config_flag(task)}{python} {env_path}"
 
     def _pip_install_command(self, task: "BaseTask") -> str | None:
         """Install requirements through uv pip."""
@@ -575,8 +748,8 @@ class UvPythonEnvironmentExecutor(PythonEnvironmentExecutor):
         uv = shlex.quote(self.uv)
         requirements = " ".join(shlex.quote(req) for req in self.requirements)
         return (
-            f"{uv} pip install --python {shlex.quote(self._python_bin(task))}"
-            f" {requirements}"
+            f"{uv} pip install{self._config_flag(task)}"
+            f" --python {shlex.quote(self._python_bin(task))} {requirements}"
         )
 
 
@@ -600,13 +773,14 @@ class VirtualenvPythonEnvironmentExecutor(PythonEnvironmentExecutor):
         """Return a human-readable backend name for setup logs."""
         return "virtualenv Python environment"
 
-    def _create_environment_command(self, task: "BaseTask") -> str:
+    async def _spec(self, task: "BaseTask") -> dict[str, object] | None:
+        """Add the interpreter that creates the venv."""
+        base = await super()._spec(task)
+        if base is None:
+            return None
+        return {**base, "python": self.python}
+
+    def _create_command(self, task: "BaseTask") -> str:
         """Return the stdlib venv creation command."""
         env_path = shlex.quote(self._environment_path(task))
-        return (
-            f"if [ -x {shlex.quote(self._python_bin(task))} ];"
-            f" then {self._reuse_log_command(task)};"
-            f" else {self._create_log_command(task)}"
-            f" && {shlex.quote(self.python)} -m venv {env_path};"
-            f" fi"
-        )
+        return f"{shlex.quote(self.python)} -m venv {env_path}"
