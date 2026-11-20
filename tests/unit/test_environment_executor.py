@@ -943,16 +943,22 @@ class TestSharedEnvironment:
             assert setup() == 0
             assert log.read_text().split() == ["create", "pip"] * 2
 
-    def test_recreate_wipes_a_ready_shared_env(self) -> None:
-        """recreate: true still removes the shared env first."""
+    async def test_recreate_builds_in_task_dir(self) -> None:
+        """recreate: true never wipes the shared env, it builds per task."""
         executor = VirtualenvPythonEnvironmentExecutor(recreate=True)
         task = _make_command_task(executor)
-        executor._shared_paths[task.id] = "/envs/venv-x"
+        executor._shared_paths[task.id] = "/envs/venv-stale"
+        target = _make_mock_target(env_root="/envs")
 
-        commands = executor._setup_commands(task)
+        with patch.object(task, "target", target):
+            await executor._resolve_shared_environment(task)
 
-        assert commands[1] == "rm -rf /envs/venv-x"
-        assert commands[2].startswith("if [ -f /envs/venv-x/.horus-ready ]")
+        target.run_command.assert_not_awaited()
+        path = executor._environment_path(task)
+        assert path == f"{task.working_dir}/.horus_python_environment"
+        setup = " ".join(executor._setup_commands(task))
+        assert "/envs/" not in setup
+        assert f"rm -rf {path}" in setup
 
     @pytest.mark.asyncio
     async def test_execute_builds_in_horus_env_root(

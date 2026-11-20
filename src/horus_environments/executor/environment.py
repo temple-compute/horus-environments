@@ -74,7 +74,9 @@ class PythonEnvironmentExecutor(BaseExecutor):
 
     recreate: bool = False
     """
-    Recreate the environment before running the task.
+    Recreate the environment before running the task. With the default
+    ``environment_dir`` the env is then built in the task working directory
+    instead of the shared one, which is left untouched.
     """
 
     _shared_prefix: ClassVar[str] = "venv"
@@ -89,7 +91,10 @@ class PythonEnvironmentExecutor(BaseExecutor):
 
     async def _resolve_shared_environment(self, task: "BaseTask") -> None:
         """Point the default ``environment_dir`` at the shared environment."""
-        if self.environment_dir != _DEFAULT_ENVIRONMENT_DIR:
+        self._shared_paths.pop(task.id, None)
+        # recreate wants a fresh env every run: build it in the task dir so a
+        # shared env is never wiped under the tasks running in it.
+        if self.environment_dir != _DEFAULT_ENVIRONMENT_DIR or self.recreate:
             return
         probe = await task.target.run_command(
             'printf %s "${HORUS_ENV_ROOT-}"', detach=False
@@ -247,18 +252,18 @@ class PythonEnvironmentExecutor(BaseExecutor):
 
     def _setup_commands(self, task: "BaseTask") -> list[str]:
         """Return all shell commands required before the runtime executes."""
-        commands: list[str] = []
         env_path = shlex.quote(self._environment_path(task))
-        if self.recreate:
-            commands.append(
-                self._log_command(
-                    _("Recreating Python environment at %(path)s")
-                    % {"path": self._environment_path(task)}
-                )
-            )
-            commands.append(f"rm -rf {env_path}")
         install = self._install_commands(task)
         if task.id not in self._shared_paths:
+            commands: list[str] = []
+            if self.recreate:
+                commands.append(
+                    self._log_command(
+                        _("Recreating Python environment at %(path)s")
+                        % {"path": self._environment_path(task)}
+                    )
+                )
+                commands.append(f"rm -rf {env_path}")
             return [
                 *commands,
                 self._create_environment_command(task),
@@ -278,11 +283,10 @@ class PythonEnvironmentExecutor(BaseExecutor):
                 f"touch {ready}",
             ]
         )
-        commands.append(
+        return [
             f"if [ -f {ready} ]; then {self._reuse_log_command(task)};"
             f" else {build}; fi"
-        )
-        return commands
+        ]
 
     def _install_commands(self, task: "BaseTask") -> list[str]:
         """Return the pip install log and command, if any requirements."""
