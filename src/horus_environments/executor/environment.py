@@ -35,16 +35,27 @@ _READY_MARKER = "__horus_environment_ready__"
 _READY = f"printf '\\n%s\\n' {_READY_MARKER}"
 
 _DEFAULT_ENVIRONMENT_DIR = ".horus_python_environment"
-# Reports the env root and flock on the target. Sentinels keep shell rc noise
-# out of the parsed values.
+# Reports the env root, flock and the installer variables on the target.
+# Sentinels keep shell rc noise out of the parsed values.
 _ROOT_SENTINEL = "__horus_env_root__"
 _LOCK_SENTINEL = "__horus_env_lock__"
+_VAR_SENTINEL = "__horus_env_var__"
 _ENV_PROBE = (
     f"printf '{_ROOT_SENTINEL}%s\\n' \"${{HORUS_ENV_ROOT-}}\";"
-    f" if command -v flock >/dev/null 2>&1; then echo {_LOCK_SENTINEL}; fi"
+    f" if command -v flock >/dev/null 2>&1; then echo {_LOCK_SENTINEL}; fi;"
+    " env | awk '/^(PIP_|UV_|CONDA|MAMBA)/"
+    f' {{ print "{_VAR_SENTINEL}" $0 }}\''
 )
 # Written into a shared environment once create and pip both succeed.
 _ENV_READY_FILE = ".horus-ready"
+
+
+def _is_local_requirement(requirement: str) -> bool:
+    """Return whether a requirement is a path, URL or pip option."""
+    requirement = requirement.strip()
+    return requirement.startswith((".", "-", "~")) or any(
+        char in requirement for char in "/\\@:"
+    )
 
 
 class PythonEnvironmentExecutor(BaseExecutor):
@@ -92,10 +103,19 @@ class PythonEnvironmentExecutor(BaseExecutor):
     # Task id -> shared environment path, set by _resolve_shared_environment.
     _shared_paths: dict[str, str] = PrivateAttr(default_factory=dict)
 
-    async def _spec(self, task: "BaseTask") -> dict[str, object]:
-        """Return what defines the built environment, hashed into its path."""
+    async def _spec(self, task: "BaseTask") -> dict[str, object] | None:
+        """
+        Return what defines the built environment, hashed into its path, or
+        ``None`` when it depends on files the hash cannot see.
+        """
         del task
-        return {"kind": self.kind, "requirements": self.requirements}
+        if any(_is_local_requirement(req) for req in self.requirements):
+            return None
+        return {
+            "kind": self.kind,
+            "requirements": self.requirements,
+            "env": self.env,
+        }
 
     async def _resolve_shared_environment(self, task: "BaseTask") -> None:
         """Point the default ``environment_dir`` at the shared environment."""
@@ -103,6 +123,9 @@ class PythonEnvironmentExecutor(BaseExecutor):
         # recreate wants a fresh env every run: build it in the task dir so a
         # shared env is never wiped under the tasks running in it.
         if self.environment_dir != _DEFAULT_ENVIRONMENT_DIR or self.recreate:
+            return
+        spec = await self._spec(task)
+        if spec is None:
             return
         probe = await task.target.run_command(_ENV_PROBE, detach=False)
         out = (await probe.communicate())[0].decode(errors="replace")
@@ -120,8 +143,13 @@ class PythonEnvironmentExecutor(BaseExecutor):
         )
         if not root.startswith("/"):
             root = f"{task.target.resolved_working_directory}/.horus_envs"
-        spec = json.dumps(await self._spec(task), sort_keys=True)
-        digest = hashlib.sha256(spec.encode()).hexdigest()[:32]
+        spec["target_env"] = sorted(
+            line.removeprefix(_VAR_SENTINEL)
+            for line in lines
+            if line.startswith(_VAR_SENTINEL)
+        )
+        encoded = json.dumps(spec, sort_keys=True).encode()
+        digest = hashlib.sha256(encoded).hexdigest()[:32]
         self._shared_paths[task.id] = str(
             PurePosixPath(root) / f"{self._shared_prefix}-{digest}"
         )
@@ -468,10 +496,13 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
 
     _shared_prefix: ClassVar[str] = "conda"
 
-    async def _spec(self, task: "BaseTask") -> dict[str, object]:
+    async def _spec(self, task: "BaseTask") -> dict[str, object] | None:
         """Add the conda flavour, packages and env file content."""
+        base = await super()._spec(task)
+        if base is None:
+            return None
         spec = {
-            **await super()._spec(task),
+            **base,
             "conda": self.conda,
             "python_version": self.python_version,
             "channels": self.channels,
@@ -483,6 +514,9 @@ class CondaPythonEnvironmentExecutor(PythonEnvironmentExecutor):
                 if is_template(self.environment_file)
                 else Path(self.environment_file).read_bytes()
             )
+            # A list item that is a path or pip option refers to other files.
+            if re.search(rb"(?m)^\s*-\s+[-./~]|file:", content):
+                return None
             spec["environment_file"] = hashlib.sha256(content).hexdigest()
         return spec
 
@@ -661,13 +695,16 @@ class UvPythonEnvironmentExecutor(PythonEnvironmentExecutor):
         """Return a human-readable backend name for setup logs."""
         return "uv Python environment"
 
-    async def _spec(self, task: "BaseTask") -> dict[str, object]:
+    async def _spec(self, task: "BaseTask") -> dict[str, object] | None:
         """Add the uv executable and requested interpreter."""
-        return {
-            **await super()._spec(task),
-            "uv": self.uv,
-            "python": self.python,
-        }
+        base = await super()._spec(task)
+        if base is None:
+            return None
+        return {**base, "uv": self.uv, "python": self.python}
+
+    def _config_flag(self, task: "BaseTask") -> str:
+        """Keep uv config files in the task dir out of a shared build."""
+        return " --no-config" if task.id in self._shared_paths else ""
 
     def _requested_python_version(self) -> str | None:
         """
@@ -683,7 +720,7 @@ class UvPythonEnvironmentExecutor(PythonEnvironmentExecutor):
         env_path = shlex.quote(self._environment_path(task))
         uv = shlex.quote(self.uv)
         python = f" --python {shlex.quote(self.python)}" if self.python else ""
-        return f"{uv} venv{python} {env_path}"
+        return f"{uv} venv{self._config_flag(task)}{python} {env_path}"
 
     def _pip_install_command(self, task: "BaseTask") -> str | None:
         """Install requirements through uv pip."""
@@ -692,8 +729,8 @@ class UvPythonEnvironmentExecutor(PythonEnvironmentExecutor):
         uv = shlex.quote(self.uv)
         requirements = " ".join(shlex.quote(req) for req in self.requirements)
         return (
-            f"{uv} pip install --python {shlex.quote(self._python_bin(task))}"
-            f" {requirements}"
+            f"{uv} pip install{self._config_flag(task)}"
+            f" --python {shlex.quote(self._python_bin(task))} {requirements}"
         )
 
 
@@ -717,9 +754,12 @@ class VirtualenvPythonEnvironmentExecutor(PythonEnvironmentExecutor):
         """Return a human-readable backend name for setup logs."""
         return "virtualenv Python environment"
 
-    async def _spec(self, task: "BaseTask") -> dict[str, object]:
+    async def _spec(self, task: "BaseTask") -> dict[str, object] | None:
         """Add the interpreter that creates the venv."""
-        return {**await super()._spec(task), "python": self.python}
+        base = await super()._spec(task)
+        if base is None:
+            return None
+        return {**base, "python": self.python}
 
     def _create_command(self, task: "BaseTask") -> str:
         """Return the stdlib venv creation command."""

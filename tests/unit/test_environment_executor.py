@@ -841,6 +841,81 @@ class TestSharedEnvironment:
 
         assert base != changed
 
+    async def test_executor_env_is_hashed(self) -> None:
+        """A different index or conda override gives a new env."""
+        base = await _shared_path(UvPythonEnvironmentExecutor())
+        index = await _shared_path(
+            UvPythonEnvironmentExecutor(env={"PIP_INDEX_URL": "https://a"})
+        )
+        cuda = await _shared_path(
+            UvPythonEnvironmentExecutor(env={"CONDA_OVERRIDE_CUDA": "12.4"})
+        )
+
+        assert base != index
+        assert base != cuda
+        assert index != cuda
+
+    async def test_target_installer_vars_are_hashed(self) -> None:
+        """Installer variables set on the target give a new env."""
+        plain = _make_mock_proc(stdout=_probe_output("/envs"))
+        mirror = _make_mock_proc(
+            stdout=_probe_output("/envs")
+            + b"__horus_env_var__PIP_INDEX_URL=https://mirror\n"
+        )
+
+        first = await _shared_path(
+            VirtualenvPythonEnvironmentExecutor(), probe=plain
+        )
+        second = await _shared_path(
+            VirtualenvPythonEnvironmentExecutor(), probe=mirror
+        )
+
+        assert first != second
+
+    @pytest.mark.parametrize(
+        "requirement",
+        [".", "./pkg", "-e .", "-r requirements.txt", "pkg @ file:///x"],
+    )
+    async def test_local_requirements_are_not_shared(
+        self, requirement: str
+    ) -> None:
+        """A requirement whose content the hash cannot see stays per task."""
+        executor = UvPythonEnvironmentExecutor(requirements=[requirement])
+        task = _make_command_task(executor)
+
+        path = await _shared_path(executor, task=task)
+
+        assert path == f"{task.working_dir}/.horus_python_environment"
+        assert "--no-config" not in " ".join(executor._setup_commands(task))
+
+    async def test_environment_file_with_local_refs_is_not_shared(
+        self, tmp_path: Path
+    ) -> None:
+        """An env file that pulls in other files stays per task."""
+        env_yaml = tmp_path / "environment.yaml"
+        env_yaml.write_text(
+            "dependencies:\n  - pip\n  - pip:\n    - -r requirements.txt\n"
+        )
+        executor = CondaPythonEnvironmentExecutor(
+            environment_file=str(env_yaml)
+        )
+        task = _make_command_task(executor)
+
+        path = await _shared_path(executor, task=task)
+
+        assert path == f"{task.working_dir}/.horus_python_environment"
+
+    async def test_shared_uv_ignores_config_files(self) -> None:
+        """A shared uv build does not read uv config from the task dir."""
+        executor = UvPythonEnvironmentExecutor(requirements=["numpy"])
+        task = _make_command_task(executor)
+        await _shared_path(executor, task=task)
+
+        setup = " ".join(executor._setup_commands(task))
+
+        assert "uv venv --no-config /envs/venv-" in setup
+        assert "uv pip install --no-config --python /envs/venv-" in setup
+
     async def test_environment_file_content_is_hashed(
         self, tmp_path: Path
     ) -> None:
