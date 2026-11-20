@@ -72,7 +72,8 @@ class PythonEnvironmentExecutor(BaseExecutor):
 
     requirements: list[str] = Field(default_factory=list)
     """
-    Python package requirements installed into the environment with pip.
+    Python package requirements installed into the environment with pip. Pin
+    versions: a shared environment keeps the versions of its first build.
     """
 
     env: dict[str, str] = Field(default_factory=dict)
@@ -82,13 +83,15 @@ class PythonEnvironmentExecutor(BaseExecutor):
 
     environment_dir: str = _DEFAULT_ENVIRONMENT_DIR
     """
-    Directory where the environment is created. Left at the default, the
-    environment is shared: it lives under ``$HORUS_ENV_ROOT`` on the target
-    (else ``.horus_envs`` in the target working directory), in a directory
-    named by a hash of its spec, and every task with the same spec reuses it.
-    A relative path is resolved against the task working directory; an
-    absolute path is used as-is (e.g. to point at, and reuse, an environment
-    that already exists on the target).
+    Directory where the environment is created. Left at the default (written
+    out or not), the environment is shared: it lives under
+    ``$HORUS_ENV_ROOT`` on the target (else ``.horus_envs`` in the target
+    working directory), in a directory named by a hash of its spec, and every
+    task with the same spec reuses it. ``HORUS_ENV_ROOT`` comes from the
+    target's environment, not from ``env``. A relative path is resolved
+    against the task working directory; an absolute path is used as-is (e.g.
+    to point at, and reuse, an environment that already exists on the
+    target).
     """
 
     recreate: bool = False

@@ -32,7 +32,7 @@ All backends share these fields:
 | `requirements` | `[]` | Packages pip-installed into the env |
 | `env` | `{}` | Extra environment variables for the process |
 | `environment_dir` | `.horus_python_environment` | Env location, relative to the task working dir. Left at the default, the env is shared (see below) |
-| `recreate` | `false` | Wipe and rebuild the env before running |
+| `recreate` | `false` | Wipe and rebuild the env before running. With the default `environment_dir`, the env is built in the task working dir instead of the shared one |
 
 Backend-specific:
 
@@ -46,10 +46,23 @@ Backend-specific:
 With the default `environment_dir`, the env is shared across tasks and runs: it
 lives in `$HORUS_ENV_ROOT` on the target (else `.horus_envs` in the target
 working directory), in a `conda-<hash>` or `venv-<hash>` directory keyed by
-the backend, `requirements`, interpreter, conda packages and channels, and the
-`environment_file` content. Any change builds a new env. A shared env is reused
-only once it is fully built (`.horus-ready` inside it); an interrupted build is
-wiped and rebuilt. Pip does not run again on reuse.
+the backend, `requirements`, interpreter, conda packages and channels, the
+`environment_file` content, `env`, and the `PIP_*`, `UV_*`, `CONDA*` and
+`MAMBA*` variables on the target. Any change builds a new env. A shared env is
+reused only once it is fully built (`.horus-ready` inside it) and its
+interpreter exists; otherwise it is wiped and rebuilt. Pip does not run again
+on reuse, and a ready env is read-only: task commands must not install into it.
+
+Pin versions: a shared env keeps the versions of its first build. To rebuild,
+change the spec or set `environment_dir`.
+
+The env stays per task when the target has no `flock`, or when `requirements`
+or the `environment_file` refer to local paths, URLs or pip options (`.`,
+`-e`, `-r`, `pkg @ file:...`), since the hash cannot see their content.
+
+`HORUS_ENV_ROOT` is read from the target's environment, not from `env`. It is
+set by whoever runs the target; a platform that lets users define environment
+variables or secrets for their tasks should reserve this name.
 
 With an explicit `environment_dir`, an existing env (and, when you pin a
 version, a matching interpreter) is reused instead of rebuilt.
