@@ -1,6 +1,7 @@
 """Unit tests for Python environment executors."""
 
 import asyncio
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -840,6 +841,45 @@ class TestSharedEnvironment:
         )
 
         assert base != changed
+
+    async def test_spec_hash_is_stable(self) -> None:
+        """
+        The hash of a fixed spec never changes: a change orphans every
+        shared env already built on disk.
+        """
+        path = await _shared_path(
+            VirtualenvPythonEnvironmentExecutor(requirements=["numpy==2.1.0"])
+        )
+
+        assert path == "/envs/venv-e161894a1261247a3d8801af704d5dc7"
+
+    @pytest.mark.skipif(shutil.which("flock") is None, reason="no flock")
+    def test_concurrent_setups_build_once(self, tmp_path: Path) -> None:
+        """Two tasks set up the same shared env at once: one build."""
+        executor = VirtualenvPythonEnvironmentExecutor()
+        task = _make_command_task(executor)
+        env_dir = tmp_path / "venv-test"
+        python = env_dir / "bin" / "python"
+        executor._shared_paths[task.id] = str(env_dir)
+        log = tmp_path / "log"
+        create = (
+            f"sleep 0.5 && mkdir -p {env_dir}/bin && : > {python}"
+            f" && chmod +x {python} && echo create >> {log}"
+        )
+
+        with patch.object(
+            VirtualenvPythonEnvironmentExecutor,
+            "_create_command",
+            return_value=create,
+        ):
+            command = executor._locked_setup_command(task)
+        procs = [
+            subprocess.Popen(["/bin/sh", "-c", command]) for _ in range(2)
+        ]
+
+        assert [proc.wait() for proc in procs] == [0, 0]
+        assert log.read_text().split() == ["create"]
+        subprocess.run(["chmod", "-R", "u+w", str(env_dir)], check=True)
 
     async def test_executor_env_is_hashed(self) -> None:
         """A different index or conda override gives a new env."""
