@@ -1015,12 +1015,14 @@ class TestSharedEnvironment:
 
     def test_ready_marker_gates_reuse_and_pip(self, tmp_path: Path) -> None:
         """
-        Only a ready env is reused, without pip; a killed or failed build is
-        wiped and rebuilt.
+        Only a ready env with its interpreter is reused, without pip, and is
+        read-only; a killed or failed build or a lost interpreter is wiped
+        and rebuilt.
         """
         executor = VirtualenvPythonEnvironmentExecutor(requirements=["x"])
         task = _make_command_task(executor)
         env_dir = tmp_path / "venv-test"
+        python = env_dir / "bin" / "python"
         executor._shared_paths[task.id] = str(env_dir)
         log = tmp_path / "log"
         pip = tmp_path / "pip_fails"
@@ -1031,11 +1033,18 @@ class TestSharedEnvironment:
                 ["/bin/sh", "-c", command], check=False
             ).returncode
 
+        def unlock() -> None:
+            subprocess.run(["chmod", "-R", "u+w", str(env_dir)], check=True)
+
+        create = (
+            f"mkdir -p {env_dir}/bin && : > {python} && chmod +x {python}"
+            f" && echo create >> {log}"
+        )
         with (
             patch.object(
                 VirtualenvPythonEnvironmentExecutor,
                 "_create_command",
-                return_value=f"mkdir -p {env_dir} && echo create >> {log}",
+                return_value=create,
             ),
             patch.object(
                 VirtualenvPythonEnvironmentExecutor,
@@ -1049,11 +1058,13 @@ class TestSharedEnvironment:
             assert setup() == 0
             assert not (env_dir / "partial").exists()
             assert (env_dir / ".horus-ready").exists()
+            assert env_dir.stat().st_mode & 0o222 == 0
             assert setup() == 0
             assert log.read_text().split() == ["create", "pip"]
 
             # A failed pip step leaves no marker, so the next run rebuilds.
             log.unlink()
+            unlock()
             (env_dir / ".horus-ready").unlink()
             pip.touch()
             assert setup() != 0
@@ -1061,6 +1072,16 @@ class TestSharedEnvironment:
             pip.unlink()
             assert setup() == 0
             assert log.read_text().split() == ["create", "pip"] * 2
+
+            # Marked ready but the interpreter is gone: rebuilt.
+            log.unlink()
+            unlock()
+            python.unlink()
+            subprocess.run(["chmod", "-R", "a-w", str(env_dir)], check=True)
+            assert setup() == 0
+            assert python.exists()
+            assert log.read_text().split() == ["create", "pip"]
+            unlock()
 
     async def test_recreate_builds_in_task_dir(self) -> None:
         """recreate: true never wipes the shared env, it builds per task."""
