@@ -321,16 +321,21 @@ class PythonEnvironmentExecutor(BaseExecutor):
         # The spec is in the path, so a ready shared env is used as is. One
         # without the marker is a killed or failed build, and one without its
         # interpreter lost its base Python: both are rebuilt. A ready env is
-        # read-only so a task command cannot change it for the others.
+        # read-only so a task command cannot change it for the others. Another
+        # uid of the group cannot delete it then, but can rename it in the
+        # group-writable env root: move it aside, drop what can be dropped.
         ready = shlex.quote(
             f"{self._environment_path(task)}/{_ENV_READY_FILE}"
         )
         python_bin = shlex.quote(self._python_bin(task))
+        stale = f"{env_path}.stale."
         build = " && ".join(
             [
                 self._create_log_command(task),
-                f"{{ chmod -R u+w {env_path} 2>/dev/null || :; }}",
-                f"rm -rf {env_path}",
+                f"if [ -e {env_path} ] || [ -L {env_path} ];"
+                f" then mv {env_path} {stale}$$; fi",
+                f"{{ chmod -R u+w {stale}* 2>/dev/null;"
+                f" rm -rf {stale}* 2>/dev/null; :; }}",
                 self._create_command(task),
                 *install,
                 f"touch {ready}",

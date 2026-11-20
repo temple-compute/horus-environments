@@ -50,7 +50,8 @@ the backend, `requirements`, interpreter, conda packages and channels, the
 `environment_file` content, `env`, and the `PIP_*`, `UV_*`, `CONDA*` and
 `MAMBA*` variables on the target. Any change builds a new env. A shared env is
 reused only once it is fully built (`.horus-ready` inside it) and its
-interpreter exists; otherwise it is wiped and rebuilt. Pip does not run again
+interpreter exists; otherwise it is moved to `<env>.stale.<pid>` and rebuilt
+(a leftover owned by another user stays there). Pip does not run again
 on reuse, and a ready env is read-only: task commands must not install into it.
 
 Pin versions: a shared env keeps the versions of its first build. To rebuild,

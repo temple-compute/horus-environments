@@ -1,6 +1,7 @@
 """Unit tests for Python environment executors."""
 
 import asyncio
+import os
 import shutil
 import subprocess
 import sys
@@ -1126,6 +1127,57 @@ class TestSharedEnvironment:
             assert python.exists()
             assert log.read_text().split() == ["create", "pip"]
             unlock()
+
+    def test_rebuild_moves_aside_an_env_it_cannot_delete(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A ready env built by another uid of the group (read-only, not ours to
+        chmod) that lost its interpreter is moved aside and rebuilt.
+        """
+        executor = VirtualenvPythonEnvironmentExecutor()
+        task = _make_command_task(executor)
+        env_dir = tmp_path / "venv-test"
+        python = env_dir / "bin" / "python"
+        executor._shared_paths[task.id] = str(env_dir)
+        real_chmod = shutil.which("chmod")
+        assert real_chmod is not None
+        # Not the owner: chmod u+w has no effect.
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        (fake_bin / "chmod").write_text(
+            f'#!/bin/sh\n[ "$2" = u+w ] && exit 0\nexec {real_chmod} "$@"\n'
+        )
+        (fake_bin / "chmod").chmod(0o755)
+        (env_dir / "bin").mkdir(parents=True)
+        (env_dir / ".horus-ready").touch()
+        subprocess.run([real_chmod, "-R", "a-w", str(env_dir)], check=True)
+        create = f"mkdir -p {env_dir}/bin && : > {python} && chmod +x {python}"
+
+        with patch.object(
+            VirtualenvPythonEnvironmentExecutor,
+            "_create_command",
+            return_value=create,
+        ):
+            command = executor._locked_setup_command(task)
+        result = subprocess.run(
+            ["/bin/sh", "-c", command],
+            check=False,
+            env={"PATH": f"{fake_bin}:/usr/bin:/bin"},
+        )
+
+        try:
+            assert result.returncode == 0
+            assert python.exists()
+            assert (env_dir / ".horus-ready").exists()
+            assert env_dir.stat().st_mode & 0o222 == 0
+            stale = list(tmp_path.glob("venv-test.stale.*"))
+            if os.geteuid() != 0:
+                assert [(s / ".horus-ready").exists() for s in stale] == [True]
+        finally:
+            subprocess.run(
+                [real_chmod, "-R", "u+w", str(tmp_path)], check=True
+            )
 
     async def test_recreate_builds_in_task_dir(self) -> None:
         """recreate: true never wipes the shared env, it builds per task."""
