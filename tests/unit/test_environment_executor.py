@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -87,7 +88,7 @@ def _make_mock_target(
 def _task_command(target: MagicMock) -> str:
     """Return the task command sent to the mock target (not the probe)."""
     commands = [c.args[0] for c in target.run_command.call_args_list]
-    return next(c for c in reversed(commands) if c != _PROBE)
+    return str(next(c for c in reversed(commands) if c != _PROBE))
 
 
 def _run_in_shell(command: str, **_kwargs: object) -> AsyncMock:
@@ -810,7 +811,10 @@ class TestSharedEnvironment:
 
     async def test_same_spec_same_dir(self) -> None:
         """Two tasks with the same spec resolve to one shared env."""
-        spec = {"python_version": "3.12", "conda_requirements": ["vina"]}
+        spec: dict[str, Any] = {
+            "python_version": "3.12",
+            "conda_requirements": ["vina"],
+        }
         first = await _shared_path(CondaPythonEnvironmentExecutor(**spec))
         second = await _shared_path(CondaPythonEnvironmentExecutor(**spec))
 
@@ -828,10 +832,10 @@ class TestSharedEnvironment:
         ],
     )
     async def test_different_spec_different_dir(
-        self, change: dict[str, object]
+        self, change: dict[str, Any]
     ) -> None:
         """Any spec change gives a new env instead of reusing the old one."""
-        spec: dict[str, object] = {
+        spec: dict[str, Any] = {
             "python_version": "3.12",
             "conda_requirements": ["vina"],
         }
