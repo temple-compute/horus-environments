@@ -324,6 +324,9 @@ class PythonEnvironmentExecutor(BaseExecutor):
         # read-only so a task command cannot change it for the others. Another
         # uid of the group cannot delete it then, but can rename it in the
         # group-writable env root: move it aside, drop what can be dropped.
+        # Installers copy instead of hard-linking from their package cache:
+        # chmod would change the cached files, and another uid can neither
+        # link nor chmod them.
         ready = shlex.quote(
             f"{self._environment_path(task)}/{_ENV_READY_FILE}"
         )
@@ -336,6 +339,8 @@ class PythonEnvironmentExecutor(BaseExecutor):
                 f" then mv {env_path} {stale}$$; fi",
                 f"{{ chmod -R u+w {stale}* 2>/dev/null;"
                 f" rm -rf {stale}* 2>/dev/null; :; }}",
+                "export CONDA_ALWAYS_COPY=true MAMBA_ALWAYS_COPY=true"
+                " UV_LINK_MODE=copy",
                 self._create_command(task),
                 *install,
                 f"touch {ready}",

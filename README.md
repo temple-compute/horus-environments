@@ -53,6 +53,7 @@ reused only once it is fully built (`.horus-ready` inside it) and its
 interpreter exists; otherwise it is moved to `<env>.stale.<pid>` and rebuilt
 (a leftover owned by another user stays there). Pip does not run again
 on reuse, and a ready env is read-only: task commands must not install into it.
+Its files are copies, not hard links into the conda, mamba or uv package cache.
 
 Pin versions: a shared env keeps the versions of its first build. To rebuild,
 change the spec or set `environment_dir`.

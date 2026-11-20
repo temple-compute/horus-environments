@@ -1179,6 +1179,33 @@ class TestSharedEnvironment:
                 [real_chmod, "-R", "u+w", str(tmp_path)], check=True
             )
 
+    def test_shared_build_copies_from_package_caches(
+        self, tmp_path: Path
+    ) -> None:
+        """A shared build never hard-links files from an installer cache."""
+        executor = CondaPythonEnvironmentExecutor()
+        task = _make_command_task(executor)
+        env_dir = tmp_path / "conda-test"
+        python = env_dir / "bin" / "python"
+        executor._shared_paths[task.id] = str(env_dir)
+        log = tmp_path / "log"
+        create = (
+            f"mkdir -p {env_dir}/bin && : > {python} && chmod +x {python}"
+            f' && echo "$CONDA_ALWAYS_COPY $MAMBA_ALWAYS_COPY $UV_LINK_MODE"'
+            f" > {log}"
+        )
+
+        with patch.object(
+            CondaPythonEnvironmentExecutor,
+            "_create_command",
+            return_value=create,
+        ):
+            command = executor._locked_setup_command(task)
+        subprocess.run(["/bin/sh", "-c", command], check=True)
+
+        assert log.read_text().split() == ["true", "true", "copy"]
+        subprocess.run(["chmod", "-R", "u+w", str(env_dir)], check=True)
+
     async def test_recreate_builds_in_task_dir(self) -> None:
         """recreate: true never wipes the shared env, it builds per task."""
         executor = VirtualenvPythonEnvironmentExecutor(recreate=True)
