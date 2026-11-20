@@ -35,6 +35,14 @@ _READY_MARKER = "__horus_environment_ready__"
 _READY = f"printf '\\n%s\\n' {_READY_MARKER}"
 
 _DEFAULT_ENVIRONMENT_DIR = ".horus_python_environment"
+# Reports the env root and flock on the target. Sentinels keep shell rc noise
+# out of the parsed values.
+_ROOT_SENTINEL = "__horus_env_root__"
+_LOCK_SENTINEL = "__horus_env_lock__"
+_ENV_PROBE = (
+    f"printf '{_ROOT_SENTINEL}%s\\n' \"${{HORUS_ENV_ROOT-}}\";"
+    f" if command -v flock >/dev/null 2>&1; then echo {_LOCK_SENTINEL}; fi"
+)
 # Written into a shared environment once create and pip both succeed.
 _ENV_READY_FILE = ".horus-ready"
 
@@ -96,16 +104,26 @@ class PythonEnvironmentExecutor(BaseExecutor):
         # shared env is never wiped under the tasks running in it.
         if self.environment_dir != _DEFAULT_ENVIRONMENT_DIR or self.recreate:
             return
-        probe = await task.target.run_command(
-            'printf %s "${HORUS_ENV_ROOT-}"', detach=False
+        probe = await task.target.run_command(_ENV_PROBE, detach=False)
+        out = (await probe.communicate())[0].decode(errors="replace")
+        lines = [line.strip() for line in out.splitlines()]
+        # Without flock, concurrent builds would mix in one dir: stay per task.
+        if await probe.wait() != 0 or _LOCK_SENTINEL not in lines:
+            return
+        root = next(
+            (
+                line.rpartition(_ROOT_SENTINEL)[2]
+                for line in reversed(lines)
+                if _ROOT_SENTINEL in line
+            ),
+            "",
         )
-        root = (await probe.communicate())[0].decode().strip() or (
-            f"{task.target.resolved_working_directory}/.horus_envs"
-        )
+        if not root.startswith("/"):
+            root = f"{task.target.resolved_working_directory}/.horus_envs"
         spec = json.dumps(await self._spec(task), sort_keys=True)
-        digest = hashlib.sha256(spec.encode()).hexdigest()[:16]
-        self._shared_paths[task.id] = (
-            f"{root.rstrip('/')}/{self._shared_prefix}-{digest}"
+        digest = hashlib.sha256(spec.encode()).hexdigest()[:32]
+        self._shared_paths[task.id] = str(
+            PurePosixPath(root) / f"{self._shared_prefix}-{digest}"
         )
 
     def _environment_path(self, task: "BaseTask") -> str:
@@ -128,7 +146,7 @@ class PythonEnvironmentExecutor(BaseExecutor):
         environment, and conda/mamba serialize on their package cache, so
         every clone pays for a full build. Under ``flock`` the first builds
         it and the rest wait, then reuse it. A target without ``flock``
-        runs the setup unlocked, as before.
+        gets no shared env and runs the per-task setup unlocked.
         """
         env_path = self._environment_path(task)
         setup = " && ".join(self._setup_commands(task))

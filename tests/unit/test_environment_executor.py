@@ -19,6 +19,7 @@ from horus_runtime.core.task.exceptions import (
 )
 
 from horus_environments.executor.environment import (
+    _ENV_PROBE,
     CondaPythonEnvironmentExecutor,
     PythonEnvironmentExecutor,
     UvPythonEnvironmentExecutor,
@@ -26,6 +27,7 @@ from horus_environments.executor.environment import (
 )
 
 _NONZERO_CODE = 7
+_DIGEST_LEN = 32
 
 
 def _make_mock_proc(
@@ -49,11 +51,21 @@ def _make_mock_proc(
     return proc
 
 
-_PROBE = 'printf %s "${HORUS_ENV_ROOT-}"'
+_PROBE = _ENV_PROBE
+
+
+def _probe_output(env_root: str = "", *, lock: bool = True) -> bytes:
+    """Return what the env probe prints on a target."""
+    out = f"__horus_env_root__{env_root}\n"
+    if lock:
+        out += "__horus_env_lock__\n"
+    return out.encode()
 
 
 def _make_mock_target(
-    proc: AsyncMock | None = None, env_root: str = ""
+    proc: AsyncMock | None = None,
+    env_root: str = "",
+    probe: AsyncMock | None = None,
 ) -> MagicMock:
     """Return a mock target whose channel methods are async."""
     target = MagicMock()
@@ -64,7 +76,7 @@ def _make_mock_target(
 
     def _run_command(command: str, **_kwargs: object) -> AsyncMock:
         if command == _PROBE:
-            return _make_mock_proc(stdout=env_root.encode())
+            return probe or _make_mock_proc(stdout=_probe_output(env_root))
         return task_proc
 
     target.run_command = AsyncMock(side_effect=_run_command)
@@ -781,10 +793,12 @@ async def _shared_path(
     executor: PythonEnvironmentExecutor,
     env_root: str = "/envs",
     task: HorusTask | None = None,
+    probe: AsyncMock | None = None,
 ) -> str:
     """Resolve and return the shared environment path for a task."""
     task = task or _make_command_task(executor)
-    with patch.object(task, "target", _make_mock_target(env_root=env_root)):
+    target = _make_mock_target(env_root=env_root, probe=probe)
+    with patch.object(task, "target", target):
         await executor._resolve_shared_environment(task)
     return executor._environment_path(task)
 
@@ -880,6 +894,36 @@ class TestSharedEnvironment:
         path = await _shared_path(CondaPythonEnvironmentExecutor(), "")
 
         assert path.startswith("/tmp/horus/.horus_envs/conda-")
+
+    @pytest.mark.parametrize(
+        ("stdout", "returncode", "expected"),
+        [
+            # rc noise before the sentinel is ignored
+            (b"motd\n" + _probe_output("/envs"), 0, "/envs/venv-"),
+            (_probe_output("/"), 0, "/venv-"),
+            (_probe_output("envs"), 0, "/tmp/horus/.horus_envs/venv-"),
+            (_probe_output("/envs", lock=False), 0, None),
+            (_probe_output("/envs"), 1, None),
+        ],
+    )
+    async def test_probe_output(
+        self, stdout: bytes, returncode: int, expected: str | None
+    ) -> None:
+        """
+        Only the sentinel line sets the root; a relative root falls back to
+        the working dir; no flock or a failed probe keeps the env per task.
+        """
+        executor = VirtualenvPythonEnvironmentExecutor()
+        task = _make_command_task(executor)
+        probe = _make_mock_proc(returncode, stdout)
+
+        path = await _shared_path(executor, task=task, probe=probe)
+
+        if expected is None:
+            assert path == f"{task.working_dir}/.horus_python_environment"
+        else:
+            assert path.startswith(expected)
+            assert len(path.rpartition("venv-")[2]) == _DIGEST_LEN
 
     async def test_explicit_environment_dir_is_not_shared(self) -> None:
         """An explicit environment_dir keeps per-task behaviour."""
